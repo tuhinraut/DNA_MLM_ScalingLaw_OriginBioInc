@@ -33,7 +33,7 @@ pip install torch numpy biopython
 Before running the full analysis, test the pipeline locally with synthetic data:
 
 ```bash
-# Run small-scale test with synthetic data (~10-30 minutes on CPU)
+# Run small-scale test with synthetic data
 ./scripts/test_scaling_orchestration.sh
 
 # This creates:
@@ -52,7 +52,7 @@ The test script:
 ### 3. Download Data (for Full Analysis)
 
 ```bash
-# Recommended: NCBI FTP (fastest, most reliable)
+# Recommended: NCBI FTP (most reliable)
 python data_downloaders/download_ncbi_ftp.py
 
 # Or download specific species:
@@ -82,9 +82,10 @@ python data_downloaders/download_ncbi_ftp.py --species human mouse rat
 - **Output**: Optimal D (tokens) for fixed N (parameters)
 
 ### Phase 3: Iso-FLOP (Find Optimal N/D Allocation)
-- **Input**: Fixed FLOPs budget (~1.34e+18)
-- **Process**: Train 5 models with varying epochs (1→8)
-- **Output**: Best model size / data trade-off
+- **Input**: Fixed compute budget (~4.19e+16 FLOPs), based on 1M model with 100% data
+- **Process**: Train 7 models (1M, 2M, 5M, 10M, 25M, 50M, 100M params) with variable data sampling
+- **Data scaling**: Explicit fractions: 100%, 50%, 20%, 10%, 4%, 2%, 1%
+- **Output**: Optimal N/D allocation for fixed compute
 
 ## Directory Structure After Setup
 
@@ -110,9 +111,18 @@ dna_mlm_scaling_package/
 python data_downloaders/download_ncbi_ftp.py
 ```
 
-### Setup Only (Generate Configs)
+### Setup (Optional - Usually Automatic)
+
+Setup runs **automatically** when you execute `run_complete_scaling_analysis.sh`. 
+Manual setup is only needed if you want to inspect configs before running:
+
 ```bash
 python scripts/setup_scaling_experiment.py
+```
+
+To skip auto-setup (e.g., when resuming a previous run):
+```bash
+./scripts/run_complete_scaling_analysis.sh --skip-setup
 ```
 
 ### Run Specific Phase
@@ -147,7 +157,6 @@ export DATA_DIR=/path/to/your/fasta/files
 **NCBI FTP (Recommended)**
 - 33 species available
 - Pre-filtered protein-coding CDS
-- Fast bulk download
 - Script: `download_ncbi_ftp.py`
 
 
@@ -166,27 +175,6 @@ export DATA_DIR=/path/to/your/fasta/files
 | 48M | 768 | 12 | 8 | 3072 | ~56.7M |
 | 100M | 1024 | 16 | 8 | 4096 | ~100.7M |
 | 200M | 1280 | 16 | 10 | 5120 | ~196.7M |
-
-## Expected Runtime
-
-### Test Run (Synthetic Data, 4 Small Models)
-
-| Hardware | Time | Details |
-|----------|------|---------|
-| CPU | 10-30 min | 4 models (100K-4M params), 1K synthetic sequences |
-| GPU | 2-5 min | Same as above, much faster |
-
-### Full Run (Real Data, 11 Models)
-
-With GPU (V100/A100):
-- **Phase 1**: 2-6 hours (11 models)
-- **Phase 2**: 1-3 hours (5 samples)
-- **Phase 3**: 2-4 hours (5 models)
-- **Total**: 5-13 hours
-
-With CPU:
-- **Not recommended** for models > 4M params
-- Would take 2-6 days
 
 ## Disk Space
 
@@ -386,6 +374,8 @@ MIT License - See LICENSE file
 
 ---
 
-**Ready to start?** Run: `./setup.sh` then `./scripts/run_complete_scaling_analysis.sh`
+**Ready to start?** Run: `./scripts/run_complete_scaling_analysis.sh`
+
+*Setup is now integrated - configs are generated automatically. Use `--skip-setup` to skip if resuming a previous run.*
 
 **Note:** This repository includes a `.gitignore` file that excludes generated data, checkpoints, and logs from version control.

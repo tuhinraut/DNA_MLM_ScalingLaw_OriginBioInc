@@ -144,13 +144,13 @@ def generate_iso_param_configs(config_dir, best_model_config):
 def generate_iso_flop_configs(config_dir):
     """Generate configs for Iso-FLOP analysis.
     
+    Specific model progression: 1M, 2M, 5M, 10M, 25M, 50M, 100M
+    Data fractions: 100%, 50%, 20%, 10%, 4%, 2%, 1%
+    
     Fixed compute budget based on 1M model with 100% data:
     C_fixed = 6 * N_1M * D_total
     
-    For each model N, data is sampled as:
-    D = C_fixed / (6 * N) = (N_1M / N) * D_total
-    
-    Larger models get less data, smaller models get more (via sampling).
+    Data is explicitly set to target fractions (not calculated from N_ref/N).
     """
     # Total available tokens (from NCBI data)
     D_total = 3_950_000_000  # ~3.95B tokens
@@ -161,18 +161,16 @@ def generate_iso_flop_configs(config_dir):
     # Fixed compute budget: C = 6 * N_ref * D_total
     C_fixed = 6 * N_ref * D_total
     
-    # Model sizes to test (same as Iso-Token, from 1M up to 200M)
-    # We use models where D_required <= D_total (data fits in corpus)
+    # Model configs with SPECIFIC data fractions as requested
+    # Format: (d_model, n_heads, n_layers, name_suffix, data_fraction)
     configs = [
-        (192, 3, 4, "1m"),       # ~1.77M (reference, 100% data)
-        (256, 4, 4, "4m"),       # ~3.2M (55.3% data)
-        (384, 6, 4, "7m"),       # ~7.1M (24.9% data)
-        (512, 8, 4, "12m"),      # ~12.6M (14.0% data)
-        (512, 8, 8, "25m"),      # ~25.2M (7.0% data)
-        (768, 12, 6, "36m"),     # ~42.5M (4.2% data)
-        (768, 12, 8, "48m"),     # ~56.7M (3.1% data)
-        (1024, 16, 8, "100m"),   # ~100.7M (1.8% data)
-        (1280, 16, 10, "200m"),  # ~196.7M (0.9% data)
+        (192, 3, 4, "1m", 1.00),     # ~1.77M, 100% data
+        (256, 4, 3, "2m", 0.50),     # ~2.37M, 50% data
+        (384, 6, 3, "5m", 0.20),     # ~5.32M, 20% data
+        (512, 8, 3, "10m", 0.10),    # ~9.45M, 10% data
+        (512, 8, 8, "25m", 0.04),    # ~25.2M, 4% data
+        (768, 12, 7, "50m", 0.02),   # ~49.6M, 2% data
+        (1024, 16, 8, "100m", 0.01), # ~100.7M, 1% data
     ]
     
     config_dir = Path(config_dir)
@@ -181,19 +179,17 @@ def generate_iso_flop_configs(config_dir):
     print(f"\n  Fixed Compute Budget: {C_fixed:.2e} FLOPs")
     print(f"  Reference: 1M model ({N_ref:,} params) with 100% data")
     print(f"  Total tokens available: {D_total:.2e}")
-    print(f"  Data strategy: Sample fraction = N_ref / N_model\n")
+    print(f"  Data strategy: Explicit fractions as specified\n")
+    print(f"  {'Model':<12} {'Params':>12} {'Data%':>6} {'Tokens':>15}")
+    print(f"  {'-'*12} {'-'*12} {'-'*6} {'-'*15}")
     
-    for d_model, n_heads, n_layers, suffix in configs:
+    for d_model, n_heads, n_layers, suffix, data_fraction in configs:
         config = generate_model_config(d_model, n_heads, n_layers)
         N = estimate_params(config)
         
-        # Calculate required data for fixed compute
-        # C_fixed = 6 * N * D => D = C_fixed / (6 * N)
-        D_required = C_fixed / (6 * N)
-        
-        # Data fraction relative to full corpus
-        data_fraction = N_ref / N  # Simplifies to D_required / D_total
+        # Data is explicitly set (not derived)
         data_pct = data_fraction * 100
+        D_required = int(D_total * data_fraction)
         
         # All models use 1 epoch on sampled data (no repetition)
         epochs = 1
@@ -206,10 +202,10 @@ def generate_iso_flop_configs(config_dir):
                 "params": N,
                 "reference_params": N_ref,
                 "data_fraction": data_fraction,
-                "data_percent": round(data_pct, 2),
-                "required_tokens": int(D_required),
+                "data_percent": data_pct,
+                "required_tokens": D_required,
                 "epochs": epochs,
-                "isoflop_mode": "fixed_compute_variable_data"
+                "isoflop_mode": "fixed_compute_explicit_data_fractions"
             }
         }
         
@@ -224,11 +220,12 @@ def generate_iso_flop_configs(config_dir):
             'params': N,
             'data_fraction': data_fraction,
             'data_percent': data_pct,
-            'required_tokens': int(D_required)
+            'required_tokens': D_required
         })
         
-        print(f"  {filename}: {N:>10,} params, {data_pct:>5.1f}% data ({int(D_required):>12,} tokens)")
+        print(f"  {suffix:<12} {N:>12,} {data_pct:>5.0f}% {D_required:>15,}")
     
+    print()
     return generated
 
 
