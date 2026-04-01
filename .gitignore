@@ -1,13 +1,46 @@
+# Generated data files (can be re-downloaded or regenerated)
+ncbi_ftp_output/
+test_experiment/
+experiments/data_samples/
+experiments/logs/
+experiments/checkpoints/
+experiments/results/
+experiments/plots/
+
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Model checkpoints and logs
+*.pth
+*.pt
 checkpoints/
 logs/
 plots/
-*.pt
-*.pth
-data/
-*.fa
-*.fa.gz
-*.fasta
-*.fasta.gz
+results/
+data_samples/
+
+# Training outputs
+training_log_*.json
+*.stdout
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/

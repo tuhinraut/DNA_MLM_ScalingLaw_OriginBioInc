@@ -55,12 +55,13 @@ class DNASequenceDataset(Dataset):
         labels = token_ids.copy()
         masked_ids = token_ids.copy()
 
+        
         for i in range(len(masked_ids)):
             if masked_ids[i] == self.tokenizer.pad_token_id:
                 labels[i] = -100
                 continue
 
-            if random.random() > self.mask_prob:
+            if random.random() < self.mask_prob: ## error here. the 15 percent masking is made to be 85% because of the incorrect if statements. changed the > to <
                 masked_ids[i] = self.tokenizer.mask_token_id
             else:
                 labels[i] = -100
@@ -81,24 +82,80 @@ class DNASequenceDataset(Dataset):
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_sequences(filepath):
-    """Load DNA sequences from the processed data file.
-
-    TODO: Implement this function.
-    The file format depends on what data_download.py produces —
-    read accordingly and return a list of DNA sequence strings.
+def load_sequences(filepaths, min_len, max_seq_len):
+    """Load sequences from one or more FASTA files.
+    
+    Args:
+        filepaths: Single path (str/Path) or list of paths to FASTA files
+        min_len: Minimum sequence length to keep
+        max_seq_len: Maximum sequence length (truncate if longer)
+    
+    Returns:
+        List of filtered sequences
     """
-    pass
+    if isinstance(filepaths, (str, Path)):
+        filepaths = [filepaths]
+    
+    all_sequences = []
+    total_skipped = 0
+    total_truncated = 0
+    
+    for filepath in filepaths:
+        filepath = Path(filepath)
+        if not filepath.exists():
+            print(f"Warning: File not found: {filepath}")
+            continue
+        
+        sequences = []
+        current_seq = []
+        
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith('>'):
+                    if current_seq:
+                        sequences.append(''.join(current_seq))
+                        current_seq = []
+                else:
+                    current_seq.append(line)
+            if current_seq:
+                sequences.append(''.join(current_seq))
+        
+        skipped_count = 0
+        trunc_count = 0
+        filtered_sequences = []
+        
+        for seq in sequences:
+            seq_len = len(seq)
+            if seq_len < min_len:
+                skipped_count += 1
+                continue
+            if seq_len > max_seq_len:
+                trunc_count += 1
+                filtered_sequences.append(seq[:max_seq_len])
+                continue
+            filtered_sequences.append(seq)
+        
+        all_sequences.extend(filtered_sequences)
+        total_skipped += skipped_count
+        total_truncated += trunc_count
+        print(f"  Loaded {filepath.name}: {len(filtered_sequences):,} sequences "
+              f"(skipped {skipped_count}, truncated {trunc_count})")
+    
+    print(f"Total sequences loaded: {len(all_sequences):,}")
+    return all_sequences
+# -----------------------------------------------------------------------------------------------------------------------------------------------------------
 
 
-def generate_synthetic_sequences(num_sequences, min_len=100, max_len=1000,
-                                  seed=42):
+def generate_synthetic_sequences(num_sequences, min_len=100, max_seq_len=1000, seed=42):
     """Generate random DNA sequences for testing / debugging."""
     rng = random.Random(seed)
     nucleotides = 'ACGT'
     sequences = []
     for _ in range(num_sequences):
-        length = rng.randint(min_len, max_len)
+        length = rng.randint(min_len, max_seq_len)
         seq = ''.join(rng.choice(nucleotides) for _ in range(length))
         sequences.append(seq)
     return sequences

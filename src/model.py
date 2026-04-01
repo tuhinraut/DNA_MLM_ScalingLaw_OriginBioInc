@@ -80,7 +80,7 @@ class MultiHeadAttention(nn.Module):
         cos, sin = self.rope(L, x.device)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        attn_weights = torch.matmul(q, k.transpose(-2, -1))
+        attn_weights = torch.matmul(q, k.transpose(-2, -1))/ math.sqrt(self.head_dim) ## divided by the head_dim to scale the attention weights
 
         if mask is not None:
             attn_weights = attn_weights.masked_fill(
@@ -160,14 +160,23 @@ class DNATransformerMLM(nn.Module):
         - LayerNorm: weight = 1.0, bias = 0.0
         - MLM head bias: zero
         """
-        pass
+        for name, param in self.named_parameters():
+            if 'token_embedding' in name:
+                nn.init.normal_(param, mean=0.0, std=0.02)
+            elif 'LayerNorm' in name or 'norm' in name:
+                nn.init.ones_(param) if 'weight' in name else nn.init.zeros_(param)
+            elif 'mlm_head' in name and 'bias' in name:
+                nn.init.zeros_(param)
+            elif 'weight' in name:
+                nn.init.xavier_uniform_(param)
+            elif 'bias' in name:
+                nn.init.zeros_(param)
 
     def forward(self, input_ids, attention_mask=None):
         x = self.token_embedding(input_ids)
-
         for layer in self.layers:
             x = layer(x, attention_mask)
-
+        x = self.norm(x)  ##  MISSING
         logits = self.mlm_head(x)
         return logits
 

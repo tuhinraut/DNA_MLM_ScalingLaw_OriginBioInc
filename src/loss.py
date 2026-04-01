@@ -34,7 +34,7 @@ class MLMCrossEntropyLoss(nn.Module):
         masked_logits = logits[mask]
         masked_labels = labels[mask]
 
-        log_probs = F.log_softmax(masked_logits, dim=-1)
-        loss = -log_probs.mean()
-
+        # log_probs = F.log_softmax(masked_logits, dim=-1)
+        # loss = -log_probs.mean() ## this line is the issue as it is averaging over all of the tokens in the batch, not just the masked tokens.
+        loss = F.cross_entropy(masked_logits, masked_labels)
         return loss, mask.sum().item()

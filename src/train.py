@@ -18,11 +18,13 @@ def parse_args():
                         help='Path to model config JSON')
     parser.add_argument('--run_name', type=str, default=None,
                         help='Name for this run (default: config filename stem)')
-    parser.add_argument('--data_path', type=str, default=None,
-                        help='Path to processed data file (omit for synthetic)')
+    parser.add_argument('--data_path', type=str, nargs='+', default=None,
+                        help='Path(s) to FASTA file(s). Can specify multiple files.')
+    parser.add_argument('--min_seq_len', type=int, default=64,
+                        help='Minimum sequence length to keep (for FASTA loading)')
     parser.add_argument('--num_synthetic', type=int, default=10000,
                         help='Number of synthetic sequences when --data_path is not set')
-    parser.add_argument('--max_seq_len', type=int, default=512)
+    parser.add_argument('--max_seq_len', type=int, default=2048)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
@@ -71,7 +73,7 @@ def estimate_flops(num_params, num_tokens):
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(model, eval_loader, loss_fn, device):
+def evaluate(model, eval_loader, loss_fn, device, args):
     """Evaluate model on a dataset.
 
     TODO: Implement this function.
@@ -87,8 +89,23 @@ def evaluate(model, eval_loader, loss_fn, device):
     Hint: loss_fn returns (loss, num_masked).  To accumulate properly,
     multiply the returned loss by num_masked before summing.
     """
-    pass
 
+    total_loss = 0
+    total_masked_tokens = 0
+    model.eval()
+    with torch.no_grad():
+        for batch in eval_loader:
+            input_ids = batch['input_ids'].to(args.device)
+            labels = batch['labels'].to(args.device)
+            attention_mask = batch['attention_mask'].to(args.device)
+            logits = model(input_ids, attention_mask)
+            loss, num_masked = loss_fn(logits, labels)
+            total_loss += loss.item() * num_masked
+            total_masked_tokens += num_masked
+    model.train()
+    average_loss = total_loss / total_masked_tokens if total_masked_tokens > 0 else 0
+    perplexity = math.exp(average_loss) if average_loss > 0 else float('inf')
+    return {'loss': average_loss, 'perplexity': perplexity}
 
 # ---------------------------------------------------------------------------
 # Main training driver
@@ -103,7 +120,10 @@ def train(args):
     tokenizer = DNATokenizer()
 
     if args.data_path is not None:
-        sequences = load_sequences(args.data_path)
+        print(f"Loading data from {len(args.data_path)} file(s):")
+        for path in args.data_path:
+            print(f"  - {path}")
+        sequences = load_sequences(args.data_path, min_len=args.min_seq_len, max_seq_len=args.max_seq_len)
     else:
         sequences = generate_synthetic_sequences(args.num_synthetic)
         print(f"Using {len(sequences)} synthetic sequences")
@@ -167,7 +187,6 @@ def train(args):
 
     log_entries = []
     tokens_seen = 0
-
     # ---- Training Loop ----
     # TODO: Implement the training loop.
     #
@@ -186,6 +205,42 @@ def train(args):
     #     learning_rate
     #   - Save a checkpoint when eval loss improves
     #   - Stop early if global_step reaches total_steps
+    best_eval_loss = float('inf')
+    global_step = 0
+    for epoch in range(args.num_epochs):
+        for batch in train_loader:
+            input_ids = batch['input_ids'].to(args.device)
+            labels = batch['labels'].to(args.device)
+            attention_mask = batch['attention_mask'].to(args.device)
+            logits = model(input_ids, attention_mask)
+            loss, num_masked = loss_fn(logits, labels)
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            scheduler.step()
+            real_tokens = attention_mask.sum().item()
+            tokens_seen += real_tokens
+            global_step += 1
+            if args.max_steps and global_step >= args.max_steps:
+                break
+
+            if global_step % args.eval_every == 0:
+                eval_results = evaluate(model, eval_loader, loss_fn, args.device, args)
+                log_entries.append({
+                    'step': tokens_seen,
+                    'train_loss': loss.item(),
+                    'eval_loss': eval_results['loss'],
+                    'eval_perplexity': eval_results['perplexity'],
+                    'tokens_seen': tokens_seen,
+                    'num_parameters': num_params,
+                    'flops': estimate_flops(num_params, tokens_seen),
+                    'learning_rate': scheduler.get_last_lr()[0],
+                })
+                if eval_results['loss'] < best_eval_loss:
+                    best_eval_loss = eval_results['loss']
+                    torch.save(model.state_dict(), os.path.join(args.save_dir, f'best_model_{run_name}.pth'))   
+                    print(f"Model saved to {os.path.join(args.save_dir, f'best_model_{run_name}.pth')}")    
+                    print(f"New best eval loss: {best_eval_loss}")
 
     # ---- Save final log ----
     log_path = os.path.join(args.log_dir, f'training_log_{run_name}.json')
