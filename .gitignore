@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+checkpoints/
+logs/
+plots/
+*.pt
+*.pth
+data/
+*.fa
+*.fa.gz
+*.fasta
+*.fasta.gz
+.DS_Store
