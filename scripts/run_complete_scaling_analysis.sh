@@ -1,646 +1,258 @@
 #!/bin/bash
-# Complete Scaling Law Analysis - Master Orchestrator
-# One command to run everything: setup → samples → all 3 phases
+# Master orchestrator for the DNA-MLM scaling-law sweep.
+#
+# Pipeline:
+#   0. Generate configs via setup_scaling_experiment.py (CLI-configurable).
+#   1. Carve one fixed held-out eval FASTA (used by EVERY run).
+#   2. Pre-sample per-fraction FASTAs for Iso-Param, and per-run FASTAs for Iso-FLOP.
+#   3. Phase 1 Iso-Token  : full train data, sweep N.
+#   4. Phase 2 Iso-Param  : fixed model, sweep D.
+#   5. Phase 3 Iso-FLOP   : multiple compute budgets, each an N sweep.
+#   6. Plots: scaling (loss vs N/D/C), iso-analysis, TTP.
 
-set -e
+set -euo pipefail
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# -------- defaults (override via env vars) -----------------------------------
+EXPERIMENT_DIR="${EXPERIMENT_DIR:-scaling_experiment}"
+DATA_DIR="${DATA_DIR:-ncbi_ftp_output}"
+EVAL_TOKENS="${EVAL_TOKENS:-50000000}"            # 50M held-out eval tokens
+ISO_TOKEN_POINTS="${ISO_TOKEN_POINTS:-8}"
+ISO_FLOP_POINTS="${ISO_FLOP_POINTS:-5}"
+ISO_FLOP_BUDGETS="${ISO_FLOP_BUDGETS:-1e15,3e15,1e16,3e16}"
+ISO_PARAM_MODEL_PARAMS="${ISO_PARAM_MODEL_PARAMS:-30000000}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-2048}"
+GRAD_ACCUM="${GRAD_ACCUM:-1}"
+EVAL_EVERY="${EVAL_EVERY:-500}"
+LR="${LR:-1e-4}"
+SEED="${SEED:-42}"
 
-# Configuration
-EXPERIMENT_DIR="scaling_experiment"
-NCBI_DATA="ncbi_ftp_output"
-CLEANUP_AFTER=false
-SKIP_PHASES=""
+SKIP=""
+CLEANUP=0
 
-# Parse arguments
 while [[ $# -gt 0 ]]; do
-    case $1 in
-        --cleanup)
-            CLEANUP_AFTER=true
-            shift
-            ;;
-        --skip-setup)
-            SKIP_PHASES="setup $SKIP_PHASES"
-            shift
-            ;;
-        --skip-samples)
-            SKIP_PHASES="samples $SKIP_PHASES"
-            shift
-            ;;
-        --skip-token)
-            SKIP_PHASES="token $SKIP_PHASES"
-            shift
-            ;;
-        --skip-param)
-            SKIP_PHASES="param $SKIP_PHASES"
-            shift
-            ;;
-        --skip-flop)
-            SKIP_PHASES="flop $SKIP_PHASES"
-            shift
-            ;;
-        --help)
-            echo "Usage: $0 [OPTIONS]"
-            echo ""
-            echo "Options:"
-            echo "  --cleanup       Delete data_samples and checkpoints after completion"
-            echo "  --skip-setup    Skip experiment setup (configs already generated)"
-            echo "  --skip-samples  Skip data sampling (samples already exist)"
-            echo "  --skip-token    Skip Phase 1 (Iso-Token)"
-            echo "  --skip-param    Skip Phase 2 (Iso-Param)"
-            echo "  --skip-flop     Skip Phase 3 (Iso-FLOP)"
-            echo "  --help          Show this help message"
-            echo ""
-            echo "Examples:"
-            echo "  $0                    # Run everything"
-            echo "  $0 --cleanup          # Run everything and cleanup after"
-            echo "  $0 --skip-setup       # Skip setup, run from existing configs"
-            exit 0
-            ;;
-        *)
-            echo "Unknown option: $1"
-            echo "Use --help for usage information"
-            exit 1
-            ;;
-    esac
+  case "$1" in
+    --skip-setup)   SKIP="$SKIP setup" ;;
+    --skip-split)   SKIP="$SKIP split" ;;
+    --skip-samples) SKIP="$SKIP samples" ;;
+    --skip-token)   SKIP="$SKIP token" ;;
+    --skip-param)   SKIP="$SKIP param" ;;
+    --skip-flop)    SKIP="$SKIP flop" ;;
+    --skip-plots)   SKIP="$SKIP plots" ;;
+    --cleanup)      CLEANUP=1 ;;
+    --help)
+      sed -n '1,30p' "$0"; exit 0 ;;
+    *) echo "unknown flag: $1"; exit 1 ;;
+  esac
+  shift
 done
 
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
+skip() { [[ " $SKIP " == *" $1 "* ]]; }
+info() { echo "[info] $*"; }
+ok()   { echo "[ok]   $*"; }
+err()  { echo "[err]  $*" >&2; }
 
-log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-}
+# -------- prerequisite checks ------------------------------------------------
+if [[ ! -f "src/train.py" ]]; then
+  err "src/train.py not found (run this from the repo root)"
+  exit 1
+fi
+if [[ ! -d "$DATA_DIR" ]]; then
+  err "data directory not found: $DATA_DIR"
+  err "run: python data_downloaders/download_ncbi_ftp.py"
+  exit 1
+fi
+info "data_dir=$DATA_DIR experiment_dir=$EXPERIMENT_DIR"
 
-log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-# ============================================
-# PHASE 0: Setup
-# ============================================
-run_setup() {
-    if [[ "$SKIP_PHASES" == *"setup"* ]]; then
-        log_info "Skipping setup (--skip-setup specified)"
-        return 0
-    fi
-
-    log_info "Phase 0: Setting up experiment..."
-    
-    if [ -d "$EXPERIMENT_DIR" ]; then
-        log_warning "Experiment directory exists. Regenerating configs..."
-        rm -rf "$EXPERIMENT_DIR"
-    fi
-    
-    python3 scripts/setup_scaling_experiment.py
-    
-    if [ ! -d "$EXPERIMENT_DIR" ]; then
-        log_error "Setup failed - experiment directory not created"
-        exit 1
-    fi
-    
-    log_success "Setup complete"
-}
-
-# ============================================
-# PHASE 0.5: Data Sampling
-# ============================================
-run_sampling() {
-    if [[ "$SKIP_PHASES" == *"samples"* ]]; then
-        log_info "Skipping data sampling (--skip-samples specified)"
-        return 0
-    fi
-
-    log_info "Phase 0.5: Generating data samples..."
-    
-    # Check if samples already exist
-    if [ -f "$EXPERIMENT_DIR/data_samples/sample_100pct.fasta" ]; then
-        log_warning "Data samples already exist. Use --skip-samples to skip this phase."
-        read -p "Regenerate samples? (y/N): " response
-        if [[ ! "$response" =~ ^[Yy]$ ]]; then
-            log_info "Using existing samples"
-            return 0
-        fi
-        rm -rf "$EXPERIMENT_DIR/data_samples/"/*.fasta
-    fi
-    
-    # Run sampling script
-    if [ -f "$EXPERIMENT_DIR/prepare_data_samples.sh" ]; then
-        cd "$EXPERIMENT_DIR"
-        bash prepare_data_samples.sh
-        cd ..
-    else
-        log_error "Sampling script not found. Run setup first."
-        exit 1
-    fi
-    
-    log_success "Data sampling complete"
-}
-
-# ============================================
-# PHASE 1: Iso-Token
-# ============================================
-run_iso_token() {
-    if [[ "$SKIP_PHASES" == *"token"* ]]; then
-        log_info "Skipping Phase 1 (Iso-Token)"
-        return 0
-    fi
-
-    log_info "========================================"
-    log_info "PHASE 1: Iso-Token Analysis"
-    log_info "Training 11 models on full dataset"
-    log_info "========================================"
-    
-    CONFIG_DIR="$EXPERIMENT_DIR/configs/iso_token"
-    PHASE_DIR="$EXPERIMENT_DIR/checkpoints/iso_token"
-    LOG_DIR="$EXPERIMENT_DIR/logs"
-    
-    mkdir -p "$PHASE_DIR" "$LOG_DIR"
-    
-    # Get all NCBI data
-    local all_data=$(find "$NCBI_DATA" -name "*_CDS.fasta" | tr '\n' ' ')
-    
-    local best_model=""
-    local best_loss=999999
-    local results_file="$EXPERIMENT_DIR/results/phase1_iso_token.json"
-    
-    log_info "Found $(echo $all_data | wc -w) data files"
-    
-    for config_file in "$CONFIG_DIR"/*.json; do
-        local model_name=$(basename "$config_file" .json)
-        local run_name="iso_token_${model_name}"
-        local log_file="$LOG_DIR/training_log_${run_name}.json"
-        
-        log_info "Training $model_name..."
-        
-        if python src/train.py \
-            --config "$config_file" \
-            --data_path $all_data \
-            --max_seq_len 2048 \
-            --min_seq_len 64 \
-            --batch_size 32 \
-            --learning_rate 1e-4 \
-            --mask_prob 0.15 \
-            --num_epochs 1 \
-            --eval_every 500 \
-            --seed 42 \
-            --run_name "$run_name" \
-            --save_dir "$PHASE_DIR" \
-            --log_dir "$LOG_DIR" 2>&1 | tee "$LOG_DIR/${run_name}.stdout"; then
-            
-            if [ -f "$log_file" ]; then
-                local final_loss=$(python3 -c "
-import json
-with open('$log_file') as f:
-    data = json.load(f)
-    print(data['log'][-1]['eval_loss'] if data['log'] else 999)
+# -------- 0: setup -----------------------------------------------------------
+if skip setup; then
+  info "skip setup"
+else
+  info "phase 0: counting tokens in $DATA_DIR ..."
+  RAW_TOKENS=$(python3 -c "
+import pathlib
+total = 0
+for p in pathlib.Path('$DATA_DIR').glob('*_CDS.fasta'):
+    with open(p) as f:
+        for line in f:
+            if not line.startswith('>'):
+                total += len(line.strip())
+print(total)
 ")
-                local params=$(python3 -c "
-import json
-with open('$log_file') as f:
-    data = json.load(f)
-    print(data['num_parameters'])
-")
-                
-                log_success "$model_name: Loss=$final_loss, Params=$params"
-                
-                # Track best
-                if (( $(echo "$final_loss < $best_loss" | bc -l 2>/dev/null || echo 0) )); then
-                    best_loss=$final_loss
-                    best_model=$model_name
-                    log_info "  → New best model: $best_model"
-                fi
-            fi
-        else
-            log_error "$model_name failed"
-        fi
-    done
-    
-    # Save results
-    python3 -c "
-import json
-result = {
-    'phase': 'iso_token',
-    'best_model': '$best_model',
-    'best_loss': $best_loss,
-    'note': 'Best model for Phase 2'
-}
-with open('$results_file', 'w') as f:
-    json.dump(result, f, indent=2)
-"
-    
-    log_success "Phase 1 complete. Best model: $best_model"
-    
-    # Export for next phases
-    export ISO_TOKEN_BEST_MODEL="$best_model"
-    export ISO_TOKEN_BEST_CONFIG="$EXPERIMENT_DIR/configs/iso_token/$best_model.json"
-}
+  info "raw token count: $RAW_TOKENS"
+  info "phase 0: generate configs"
+  python scripts/setup_scaling_experiment.py \
+    --experiment_dir "$EXPERIMENT_DIR" \
+    --data_total_tokens "$RAW_TOKENS" \
+    --max_seq_len "$MAX_SEQ_LEN" \
+    --iso_token_points "$ISO_TOKEN_POINTS" \
+    --iso_param_model "$ISO_PARAM_MODEL_PARAMS" \
+    --iso_flop_budgets "$ISO_FLOP_BUDGETS" \
+    --iso_flop_points_per_bucket "$ISO_FLOP_POINTS"
+  ok "configs generated"
+fi
 
-# ============================================
-# PHASE 2: Iso-Param
-# ============================================
-run_iso_param() {
-    if [[ "$SKIP_PHASES" == *"param"* ]]; then
-        log_info "Skipping Phase 2 (Iso-Param)"
-        return 0
-    fi
+SPLIT_DIR="$EXPERIMENT_DIR/data_samples/split"
+EVAL_FASTA="$SPLIT_DIR/eval.fasta"
+TRAIN_FASTA="$SPLIT_DIR/train_full.fasta"
 
-    log_info "========================================"
-    log_info "PHASE 2: Iso-Param Analysis"
-    log_info "Testing optimal token count"
-    log_info "========================================"
-    
-    # Determine which model to use
-    if [ -z "$ISO_TOKEN_BEST_MODEL" ]; then
-        # Try to load from Phase 1 results
-        local p1_results="$EXPERIMENT_DIR/results/phase1_iso_token.json"
-        if [ -f "$p1_results" ]; then
-            ISO_TOKEN_BEST_MODEL=$(python3 -c "
-import json
-with open('$p1_results') as f:
-    data = json.load(f)
-    print(data.get('best_model', 'model_100m'))
-")
-            ISO_TOKEN_BEST_CONFIG="$EXPERIMENT_DIR/configs/iso_token/$ISO_TOKEN_BEST_MODEL.json"
-            log_info "Using best model from Phase 1: $ISO_TOKEN_BEST_MODEL"
-        else
-            # Default fallback
-            ISO_TOKEN_BEST_MODEL="model_100m"
-            ISO_TOKEN_BEST_CONFIG="$EXPERIMENT_DIR/configs/iso_token/model_100m.json"
-            log_warning "Phase 1 results not found, using default: $ISO_TOKEN_BEST_MODEL"
-        fi
-    fi
-    
-    local phase_dir="$EXPERIMENT_DIR/checkpoints/iso_param"
-    local log_dir="$EXPERIMENT_DIR/logs"
-    local results_file="$EXPERIMENT_DIR/results/phase2_iso_param.json"
-    
-    mkdir -p "$phase_dir"
-    
-    log_info "Testing $ISO_TOKEN_BEST_MODEL on different data sizes..."
-    
-    for sample_file in "$EXPERIMENT_DIR/data_samples"/sample_*.fasta; do
-        local sample_name=$(basename "$sample_file" .fasta)
-        local run_name="iso_param_${ISO_TOKEN_BEST_MODEL}_${sample_name}"
-        local log_file="$log_dir/training_log_${run_name}.json"
-        
-        log_info "Training on $sample_name..."
-        
-        if python src/train.py \
-            --config "$ISO_TOKEN_BEST_CONFIG" \
-            --data_path "$sample_file" \
-            --max_seq_len 2048 \
-            --min_seq_len 64 \
-            --batch_size 32 \
-            --learning_rate 1e-4 \
-            --mask_prob 0.15 \
-            --num_epochs 1 \
-            --eval_every 500 \
-            --seed 42 \
-            --run_name "$run_name" \
-            --save_dir "$phase_dir" \
-            --log_dir "$log_dir" 2>&1 | tee "$log_dir/${run_name}.stdout"; then
-            
-            if [ -f "$log_file" ]; then
-                local final_loss=$(python3 -c "
-import json
-with open('$log_file') as f:
-    data = json.load(f)
-    print(data['log'][-1]['eval_loss'] if data['log'] else 999)
-")
-                local tokens=$(python3 -c "
-import json
-with open('$log_file') as f:
-    data = json.load(f)
-    print(data['final_tokens_seen'])
-")
-                log_success "$sample_name: Loss=$final_loss, Tokens=$tokens"
-            fi
-        else
-            log_error "$sample_name failed"
-        fi
-    done
-    
-    # Save results summary
-    python3 -c "
-import json
-import glob
+# -------- 1: eval/train split -----------------------------------------------
+if skip split; then
+  info "skip split"
+else
+  info "phase 1: carve fixed held-out eval set ($EVAL_TOKENS tokens)"
+  python "$EXPERIMENT_DIR/utils/carve_eval_split.py" \
+    --data_dir "$DATA_DIR" \
+    --eval_tokens "$EVAL_TOKENS" \
+    --train_out "$TRAIN_FASTA" \
+    --eval_out "$EVAL_FASTA" \
+    --max_len "$MAX_SEQ_LEN" --seed "$SEED"
+  ok "split carved"
+fi
 
-results = []
-for log_file in glob.glob('$log_dir/training_log_iso_param_*.json'):
-    with open(log_file) as f:
-        data = json.load(f)
-        if data.get('log'):
-            results.append({
-                'model': '$ISO_TOKEN_BEST_MODEL',
-                'tokens': data['final_tokens_seen'],
-                'loss': data['log'][-1]['eval_loss']
-            })
-
-result = {'phase': 'iso_param', 'model': '$ISO_TOKEN_BEST_MODEL', 'results': results}
-with open('$results_file', 'w') as f:
-    json.dump(result, f, indent=2)
-" 2>/dev/null || true
-    
-    log_success "Phase 2 complete"
-}
-
-# ============================================
-# PHASE 3: Iso-FLOP
-# ============================================
-run_iso_flop() {
-    if [[ "$SKIP_PHASES" == *"flop"* ]]; then
-        log_info "Skipping Phase 3 (Iso-FLOP)"
-        return 0
-    fi
-
-    log_info "========================================"
-    log_info "PHASE 3: Iso-FLOP Analysis"
-    log_info "Fixed compute: variable data per model"
-    log_info "========================================"
-    
-    local phase_dir="$EXPERIMENT_DIR/checkpoints/iso_flop"
-    local log_dir="$EXPERIMENT_DIR/logs"
-    local samples_dir="$EXPERIMENT_DIR/data_samples/iso_flop"
-    local results_file="$EXPERIMENT_DIR/results/phase3_iso_flop.json"
-    
-    mkdir -p "$phase_dir" "$samples_dir"
-    
-    # Get all NCBI data files
-    local all_data=$(find "$NCBI_DATA" -name "*_CDS.fasta" | tr '\n' ' ')
-    
-    log_info "Testing models with data sampled for fixed compute budget..."
-    
-    for config_file in "$EXPERIMENT_DIR/configs/iso_flop"/*.json; do
-        local model_name=$(basename "$config_file" .json)
-        
-        # Extract config metadata
-        local data_fraction=$(python3 -c "
-import json
-with open('$config_file') as f:
-    data = json.load(f)
-    print(data.get('_meta', {}).get('data_fraction', 1.0))
-")
-        local data_pct=$(python3 -c "
-import json
-with open('$config_file') as f:
-    data = json.load(f)
-    print(data.get('_meta', {}).get('data_percent', 100))
-")
-        local params=$(python3 -c "
-import json
-with open('$config_file') as f:
-    data = json.load(f)
-    print(data.get('_meta', {}).get('params', 0))
-")
-        local target_flops=$(python3 -c "
-import json
-with open('$config_file') as f:
-    data = json.load(f)
-    print(data.get('_meta', {}).get('target_flops', 0))
-")
-        
-        local run_name="${model_name}"
-        local sample_file="$samples_dir/${model_name}_sample.fasta"
-        local log_file="$log_dir/training_log_${run_name}.json"
-        
-        # Create sampled data if it doesn't exist
-        if [ ! -f "$sample_file" ]; then
-            log_info "Creating ${data_pct}% data sample for $model_name..."
-            
-            python3 << EOF
-import random
-from pathlib import Path
+SAMPLE_DIR="$EXPERIMENT_DIR/data_samples/iso_param"
+# -------- 2: iso-param data samples (token-budgeted) ------------------------
+if skip samples; then
+  info "skip samples"
+else
+  info "phase 2: pre-sample iso-param FASTAs (by token budget)"
+  mkdir -p "$SAMPLE_DIR"
+  # Fractions of what remains in the train pool AFTER the eval split.
+  TRAIN_POOL_TOKENS=$(python3 -c "
 import sys
-
-random.seed(42)  # Reproducible sampling
-
-# Get all input files
-input_files = "$all_data".split()
-data_fraction = float("$data_fraction")
-sample_file = "$sample_file"
-
-# Collect all sequences with their headers
-all_sequences = []
-for filepath in input_files:
-    filepath = Path(filepath)
-    if not filepath.exists():
-        continue
-    
-    with open(filepath, 'r') as f:
-        content = f.read()
-    
-    # Parse FASTA
-    entries = content.split('>')[1:]  # Skip empty first split
-    for entry in entries:
-        if '\n' in entry:
-            header, seq = entry.split('\n', 1)
-            seq = seq.replace('\n', '').strip()
-            if len(seq) >= 64:  # Minimum length filter
-                all_sequences.append((header, seq))
-
-# Sample
-num_to_sample = max(1, int(len(all_sequences) * data_fraction))
-sampled = random.sample(all_sequences, min(num_to_sample, len(all_sequences)))
-
-# Write output
-Path(sample_file).parent.mkdir(parents=True, exist_ok=True)
-with open(sample_file, 'w') as f:
-    for header, seq in sampled:
-        f.write(f">{header}\n{seq}\n")
-
-print(f"Sampled {len(sampled)}/{len(all_sequences)} sequences ({data_fraction*100:.1f}%)")
-EOF
-        fi
-        
-        log_info "Training $model_name (${params} params) on ${data_pct}% data..."
-        log_info "Target FLOPs: $(printf '%.2e' $target_flops)"
-        
-        if python src/train.py \
-            --config "$config_file" \
-            --data_path "$sample_file" \
-            --max_seq_len 2048 \
-            --min_seq_len 64 \
-            --batch_size 32 \
-            --learning_rate 1e-4 \
-            --mask_prob 0.15 \
-            --num_epochs 1 \
-            --eval_every 500 \
-            --seed 42 \
-            --run_name "$run_name" \
-            --save_dir "$phase_dir" \
-            --log_dir "$log_dir" 2>&1 | tee "$log_dir/${run_name}.stdout"; then
-            
-            if [ -f "$log_file" ]; then
-                local final_loss=$(python3 -c "
-import json
-with open('$log_file') as f:
-    data = json.load(f)
-    print(data['log'][-1]['eval_loss'] if data['log'] else 999)
+total = 0
+with open('$TRAIN_FASTA') as f:
+    for line in f:
+        if not line.startswith('>'):
+            total += len(line.strip())
+print(total)
 ")
-                local actual_flops=$(python3 -c "
-import json
-with open('$log_file') as f:
-    data = json.load(f)
-    print(data.get('final_flops', 0))
-")
-                local actual_tokens=$(python3 -c "
-import json
-with open('$log_file') as f:
-    data = json.load(f)
-    print(data.get('final_tokens_seen', 0))
-")
-                log_success "$model_name: Loss=$final_loss, FLOPs=$actual_flops, Tokens=$actual_tokens"
-            fi
-        else
-            log_error "$model_name failed"
-        fi
+  info "train pool has $TRAIN_POOL_TOKENS tokens"
+  for FRAC in 0.0625 0.125 0.25 0.5 1.0; do
+    TARGET=$(python3 -c "print(int($TRAIN_POOL_TOKENS * $FRAC))")
+    LABEL=$(python3 -c "print(f'{$FRAC*100:g}pct'.replace('.','p'))")
+    OUT="$SAMPLE_DIR/sample_${LABEL}.fasta"
+    if [[ -f "$OUT" ]]; then
+      info "  exists: $OUT"
+      continue
+    fi
+    python "$EXPERIMENT_DIR/utils/sample_to_fasta.py" \
+      --data_dir "$SPLIT_DIR" \
+      --target_tokens "$TARGET" \
+      --output "$OUT" \
+      --pattern "train_full.fasta" \
+      --max_len "$MAX_SEQ_LEN" --seed "$SEED"
+  done
+  ok "iso-param samples ready"
+fi
+
+# -------- helper: run training ----------------------------------------------
+CKPT_BASE="$EXPERIMENT_DIR/checkpoints"
+LOG_DIR="$EXPERIMENT_DIR/logs"
+mkdir -p "$LOG_DIR"
+
+train_one() {
+  # args: config, run_name, train_fasta, phase_dir
+  local CONFIG="$1" NAME="$2" TRAIN="$3" PHASE="$4"
+  local CKPT_DIR="$CKPT_BASE/$PHASE"
+  mkdir -p "$CKPT_DIR"
+  if [[ -f "$LOG_DIR/training_log_${NAME}.json" ]]; then
+    info "  [$NAME] already done, skipping"
+    return 0
+  fi
+  python src/train.py \
+    --config "$CONFIG" \
+    --run_name "$NAME" \
+    --data_path "$TRAIN" \
+    --eval_data_path "$EVAL_FASTA" \
+    --max_seq_len "$MAX_SEQ_LEN" \
+    --batch_size "$BATCH_SIZE" \
+    --gradient_accumulation_steps "$GRAD_ACCUM" \
+    --learning_rate "$LR" \
+    --num_epochs 1 \
+    --eval_every "$EVAL_EVERY" \
+    --seed "$SEED" \
+    --save_dir "$CKPT_DIR" \
+    --log_dir "$LOG_DIR"
+}
+
+# -------- 3: Iso-Token -------------------------------------------------------
+if skip token; then
+  info "skip phase 3 (iso-token)"
+else
+  info "phase 3: Iso-Token (N sweep, fixed D)"
+  for CFG in "$EXPERIMENT_DIR"/configs/iso_token/*.json; do
+    NAME="iso_token_$(basename "$CFG" .json)"
+    train_one "$CFG" "$NAME" "$TRAIN_FASTA" "iso_token"
+  done
+  ok "iso-token done"
+fi
+
+# -------- 4: Iso-Param -------------------------------------------------------
+if skip param; then
+  info "skip phase 4 (iso-param)"
+else
+  info "phase 4: Iso-Param (D sweep, fixed N)"
+  for CFG in "$EXPERIMENT_DIR"/configs/iso_param/*.json; do
+    MODEL_NAME=$(basename "$CFG" .json)
+    for SAMPLE in "$SAMPLE_DIR"/sample_*.fasta; do
+      LABEL=$(basename "$SAMPLE" .fasta | sed 's/sample_//')
+      NAME="iso_param_${MODEL_NAME}_${LABEL}"
+      train_one "$CFG" "$NAME" "$SAMPLE" "iso_param"
     done
-    
-    # Generate summary
-    log_info "Generating Iso-FLOP summary..."
-    python3 << EOF
+  done
+  ok "iso-param done"
+fi
+
+# -------- 5: Iso-FLOP --------------------------------------------------------
+if skip flop; then
+  info "skip phase 5 (iso-flop)"
+else
+  info "phase 5: Iso-FLOP (multi-budget, N sweep per budget)"
+  ISO_FLOP_DATA_DIR="$EXPERIMENT_DIR/data_samples/iso_flop"
+  mkdir -p "$ISO_FLOP_DATA_DIR"
+  for BUCKET in "$EXPERIMENT_DIR"/configs/iso_flop/*/; do
+    for CFG in "$BUCKET"*.json; do
+      [[ -f "$CFG" ]] || continue
+      NAME="iso_flop_$(basename "$CFG" .json)"
+      # required_tokens is stored in the config's _meta
+      TARGET=$(python3 -c "
 import json
-import glob
-from pathlib import Path
+print(json.load(open('$CFG'))['_meta']['required_tokens'])
+")
+      SAMPLE="$ISO_FLOP_DATA_DIR/${NAME}.fasta"
+      if [[ ! -f "$SAMPLE" ]]; then
+        python "$EXPERIMENT_DIR/utils/sample_to_fasta.py" \
+          --data_dir "$SPLIT_DIR" \
+          --target_tokens "$TARGET" \
+          --output "$SAMPLE" \
+          --pattern "train_full.fasta" \
+          --max_len "$MAX_SEQ_LEN" --seed "$SEED"
+      fi
+      train_one "$CFG" "$NAME" "$SAMPLE" "iso_flop"
+    done
+  done
+  ok "iso-flop done"
+fi
 
-log_dir = "$log_dir"
-results_file = "$results_file"
+# -------- 6: plots -----------------------------------------------------------
+PLOT_DIR="$EXPERIMENT_DIR/plots"
+mkdir -p "$PLOT_DIR"
+if skip plots; then
+  info "skip plots"
+else
+  info "phase 6: plots"
+  python scripts/plot_scaling.py      --log_dir "$LOG_DIR" --output_dir "$PLOT_DIR"
+  python scripts/plot_iso_analysis.py --log_dir "$LOG_DIR" --output_dir "$PLOT_DIR"
+  python scripts/plot_ttp.py          --log_dir "$LOG_DIR" --output_dir "$PLOT_DIR"
+  ok "plots written to $PLOT_DIR"
+fi
 
-results = []
-for log_file in glob.glob(f'{log_dir}/training_log_iso_flop_*.json'):
-    with open(log_file) as f:
-        data = json.load(f)
-    
-    if data.get('log'):
-        meta = data.get('_meta', {})
-        results.append({
-            'model': data.get('run_name', ''),
-            'params': meta.get('params', 0),
-            'data_fraction': meta.get('data_fraction', 1.0),
-            'target_flops': meta.get('target_flops', 0),
-            'actual_flops': data.get('final_flops', 0),
-            'tokens': data.get('final_tokens_seen', 0),
-            'loss': data['log'][-1]['eval_loss']
-        })
+# -------- cleanup ------------------------------------------------------------
+if [[ "$CLEANUP" -eq 1 ]]; then
+  info "cleanup: removing data_samples and checkpoints"
+  rm -rf "$EXPERIMENT_DIR/data_samples" "$CKPT_BASE"
+fi
 
-Path(results_file).parent.mkdir(parents=True, exist_ok=True)
-with open(results_file, 'w') as f:
-    json.dump(results, f, indent=2)
-
-print(f"Saved results to {results_file}")
-print(f"Models tested: {len(results)}")
-for r in sorted(results, key=lambda x: x['params']):
-    print(f"  {r['model']}: {r['params']/1e6:.1f}M params, {r['data_fraction']*100:.1f}% data, loss={r['loss']:.4f}")
-EOF
-    
-    log_success "Phase 3 complete"
-}
-
-# ============================================
-# Cleanup
-# ============================================
-run_cleanup() {
-    if [ "$CLEANUP_AFTER" = false ]; then
-        return 0
-    fi
-
-    log_info "========================================"
-    log_info "Cleaning up..."
-    log_info "========================================"
-    
-    # Calculate space to be freed
-    local sample_size=$(du -sh "$EXPERIMENT_DIR/data_samples/" 2>/dev/null | cut -f1 || echo "0")
-    local checkpoint_size=$(du -sh "$EXPERIMENT_DIR/checkpoints/" 2>/dev/null | cut -f1 || echo "0")
-    
-    log_info "Will free: ~$sample_size (samples) + ~$checkpoint_size (checkpoints)"
-    
-    read -p "Proceed with cleanup? (y/N): " response
-    if [[ "$response" =~ ^[Yy]$ ]]; then
-        rm -rf "$EXPERIMENT_DIR/data_samples/"/*.fasta
-        rm -rf "$EXPERIMENT_DIR/checkpoints/"
-        log_success "Cleanup complete. Kept logs/ and results/ for analysis."
-    else
-        log_info "Cleanup skipped"
-    fi
-}
-
-# ============================================
-# Summary
-# ============================================
-show_summary() {
-    log_info "========================================"
-    log_info "SCALING LAW ANALYSIS COMPLETE"
-    log_info "========================================"
-    echo ""
-    echo "Results available in: $EXPERIMENT_DIR/results/"
-    ls -lh "$EXPERIMENT_DIR/results/" 2>/dev/null || echo "  (No result files found)"
-    echo ""
-    echo "Logs available in: $EXPERIMENT_DIR/logs/"
-    echo "  Training logs: $(ls -1 "$EXPERIMENT_DIR/logs/"/*.json 2>/dev/null | wc -l) files"
-    echo ""
-    echo "Next steps:"
-    echo "  1. Review results in $EXPERIMENT_DIR/results/"
-    echo "  2. Analyze with plotting scripts"
-    echo "  3. Optionally cleanup: rm -rf $EXPERIMENT_DIR/data_samples/ $EXPERIMENT_DIR/checkpoints/"
-    echo ""
-    
-    # Show disk usage
-    echo "Disk usage:"
-    du -sh "$EXPERIMENT_DIR/" 2>/dev/null || true
-}
-
-# ============================================
-# Main
-# ============================================
-main() {
-    echo ""
-    echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║    COMPLETE SCALING LAW ANALYSIS FOR DNA MLM             ║"
-    echo "║    Automatic Pipeline - All 3 Phases                     ║"
-    echo "╚════════════════════════════════════════════════════════════╝"
-    echo ""
-    
-    # Check prerequisites
-    if [ ! -d "$NCBI_DATA" ]; then
-        log_error "NCBI data directory not found: $NCBI_DATA"
-        log_info "Please download data first using download_ncbi_ftp.py"
-        exit 1
-    fi
-    
-    if [ ! -f "train.py" ]; then
-        log_error "train.py not found in current directory"
-        exit 1
-    fi
-    
-    log_info "Prerequisites check passed"
-    log_info "NCBI data: $(du -sh $NCBI_DATA | cut -f1)"
-    
-    # Run all phases
-    run_setup
-    run_sampling
-    run_iso_token
-    run_iso_param
-    run_iso_flop
-    
-    # Show final summary
-    show_summary
-    
-    # Optional cleanup
-    run_cleanup
-    
-    log_success "All phases complete!"
-}
-
-# Run
-main "$@"
+echo
+echo "all done. logs in $LOG_DIR, plots in $PLOT_DIR"

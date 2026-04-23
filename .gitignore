@@ -1,43 +1,37 @@
-# Generated data files (can be re-downloaded or regenerated)
+# Downloaded data (re-runnable via setup.sh)
 ncbi_ftp_output/
+
+# Generated experiment outputs
+scaling_experiment/
 test_experiment/
-experiments/data_samples/
-experiments/logs/
-experiments/checkpoints/
-experiments/results/
-experiments/plots/
-
-# Python cache
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-*.so
-
-# Model checkpoints and logs
-*.pth
-*.pt
+experiments/
+data_samples/
 checkpoints/
 logs/
 plots/
 results/
-data_samples/
 
-# Training outputs
+# Per-run files produced by the pipeline
 training_log_*.json
-*.stdout
+*.pth
+*.pt
 
-# IDE
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+.Python
+
+# OS / IDE
+.DS_Store
+Thumbs.db
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
-# OS
-.DS_Store
-Thumbs.db
 
 # Virtual environments
 venv/

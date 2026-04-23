@@ -1,490 +1,403 @@
-#!/usr/bin/env python3
-"""Setup scaling law experiment with generated configs.
+"""Generate model/data configs for the three-phase scaling-law sweep.
 
-Creates folder structure and config files for:
-- Phase 1: Iso-Token (vary model size, constant data)
-- Phase 2: Iso-Param (constant model, vary data via random sampling)
-- Phase 3: Iso-FLOP (constant compute, vary N/D ratio)
-"""
+Everything here is CLI-configurable -- no hardcoded scale counts.
 
-import json
-import os
-from pathlib import Path
-import math
-
-
-def generate_model_config(d_model, n_heads, n_layers, d_ff=None, dropout=0.1):
-    """Generate a model config dict."""
-    if d_ff is None:
-        d_ff = 4 * d_model
-    
-    return {
-        "d_model": d_model,
-        "n_heads": n_heads,
-        "n_layers": n_layers,
-        "d_ff": d_ff,
-        "dropout": dropout,
-        "vocab_size": 7,
-        "max_seq_len": 2048
-    }
-
-
-def estimate_params(config):
-    """Estimate parameter count for a config."""
-    d_model = config["d_model"]
-    n_heads = config["n_heads"]
-    n_layers = config["n_layers"]
-    d_ff = config["d_ff"]
-    vocab_size = config.get("vocab_size", 7)
-    
-    embeddings = 2 * vocab_size * d_model
-    attn_params = 4 * d_model * d_model
-    ffn_params = 2 * d_model * d_ff
-    layer_norm_params = 4 * d_model
-    per_layer = attn_params + ffn_params + layer_norm_params
-    transformer = n_layers * per_layer
-    
-    return embeddings + transformer
-
-
-def setup_folder_structure(base_dir="scaling_experiment"):
-    """Create folder structure for the experiment."""
-    dirs = {
-        "configs": {
-            "iso_token": {},
-            "iso_param": {},
-            "iso_flop": {}
-        },
-        "logs": {},
-        "checkpoints": {
-            "iso_token": {},
-            "iso_param": {},
-            "iso_flop": {}
-        },
-        "results": {},
-        "data_samples": {}  # Pre-sampled FASTA files
-    }
-    
-    def create_dirs(path, structure):
-        for name, sub in structure.items():
-            new_path = path / name
-            new_path.mkdir(parents=True, exist_ok=True)
-            if sub:
-                create_dirs(new_path, sub)
-    
-    base = Path(base_dir)
-    create_dirs(base, dirs)
-    print(f"Created folder structure at: {base.absolute()}")
-    return base
-
-
-def generate_iso_token_configs(config_dir):
-    """Generate configs for Iso-Token analysis.
-    
-    Vary model size from 100K to ~200M params (Chinchilla optimal).
-    Use consistent ratios: d_ff = 4*d_model, heads maintain head_dim >= 32.
-    """
-    configs = [
-        # (d_model, n_heads, n_layers, name_suffix)
-        (64, 2, 2, "100k"),      # ~100K
-        (128, 4, 2, "400k"),     # ~400K
-        (192, 3, 4, "1m"),       # ~1.8M
-        (256, 4, 4, "4m"),       # ~3.2M
-        (384, 6, 4, "7m"),       # ~7.1M
-        (512, 8, 4, "12m"),      # ~12.6M
-        (512, 8, 8, "25m"),      # ~25M
-        (768, 12, 6, "36m"),     # ~42M
-        (768, 12, 8, "48m"),     # ~57M
-        (1024, 16, 8, "100m"),   # ~100M
-        (1280, 16, 10, "200m"),  # ~200M (Chinchilla optimal for ~4B tokens)
-    ]
-    
-    config_dir = Path(config_dir)
-    generated = []
-    
-    for d_model, n_heads, n_layers, suffix in configs:
-        config = generate_model_config(d_model, n_heads, n_layers)
-        params = estimate_params(config)
-        
-        filename = f"model_{suffix}.json"
-        filepath = config_dir / filename
-        
-        with open(filepath, 'w') as f:
-            json.dump(config, f, indent=2)
-        
-        generated.append({
-            'file': filename,
-            'params': params,
-            'config': config
-        })
-        print(f"  {filename}: {params:,} params")
-    
-    return generated
-
-
-def generate_iso_param_configs(config_dir, best_model_config):
-    """Generate configs for Iso-Param analysis.
-    
-    All use the same model (best from Iso-Token), just varying data samples.
-    We only need one config file since data sampling happens at runtime.
-    """
-    config_dir = Path(config_dir)
-    
-    # Copy the best model config for reference
-    filepath = config_dir / "iso_param_model.json"
-    with open(filepath, 'w') as f:
-        json.dump(best_model_config, f, indent=2)
-    
-    params = estimate_params(best_model_config)
-    print(f"  Iso-Param model: {params:,} params")
-    
-    return filepath
-
-
-def generate_iso_flop_configs(config_dir):
-    """Generate configs for Iso-FLOP analysis.
-    
-    Specific model progression: 1M, 2M, 5M, 10M, 25M, 50M, 100M
-    Data fractions: 100%, 50%, 20%, 10%, 4%, 2%, 1%
-    
-    Fixed compute budget based on 1M model with 100% data:
-    C_fixed = 6 * N_1M * D_total
-    
-    Data is explicitly set to target fractions (not calculated from N_ref/N).
-    """
-    # Total available tokens (from NCBI data)
-    D_total = 3_950_000_000  # ~3.95B tokens
-    
-    # Reference: 1M model parameters
-    N_ref = 1_770_000  # ~1.77M params (192, 3, 4 config)
-    
-    # Fixed compute budget: C = 6 * N_ref * D_total
-    C_fixed = 6 * N_ref * D_total
-    
-    # Model configs with SPECIFIC data fractions as requested
-    # Format: (d_model, n_heads, n_layers, name_suffix, data_fraction)
-    configs = [
-        (192, 3, 4, "1m", 1.00),     # ~1.77M, 100% data
-        (256, 4, 3, "2m", 0.50),     # ~2.37M, 50% data
-        (384, 6, 3, "5m", 0.20),     # ~5.32M, 20% data
-        (512, 8, 3, "10m", 0.10),    # ~9.45M, 10% data
-        (512, 8, 8, "25m", 0.04),    # ~25.2M, 4% data
-        (768, 12, 7, "50m", 0.02),   # ~49.6M, 2% data
-        (1024, 16, 8, "100m", 0.01), # ~100.7M, 1% data
-    ]
-    
-    config_dir = Path(config_dir)
-    generated = []
-    
-    print(f"\n  Fixed Compute Budget: {C_fixed:.2e} FLOPs")
-    print(f"  Reference: 1M model ({N_ref:,} params) with 100% data")
-    print(f"  Total tokens available: {D_total:.2e}")
-    print(f"  Data strategy: Explicit fractions as specified\n")
-    print(f"  {'Model':<12} {'Params':>12} {'Data%':>6} {'Tokens':>15}")
-    print(f"  {'-'*12} {'-'*12} {'-'*6} {'-'*15}")
-    
-    for d_model, n_heads, n_layers, suffix, data_fraction in configs:
-        config = generate_model_config(d_model, n_heads, n_layers)
-        N = estimate_params(config)
-        
-        # Data is explicitly set (not derived)
-        data_pct = data_fraction * 100
-        D_required = int(D_total * data_fraction)
-        
-        # All models use 1 epoch on sampled data (no repetition)
-        epochs = 1
-        
-        # Store config with metadata
-        config_with_meta = {
-            **config,
-            "_meta": {
-                "target_flops": C_fixed,
-                "params": N,
-                "reference_params": N_ref,
-                "data_fraction": data_fraction,
-                "data_percent": data_pct,
-                "required_tokens": D_required,
-                "epochs": epochs,
-                "isoflop_mode": "fixed_compute_explicit_data_fractions"
-            }
-        }
-        
-        filename = f"iso_flop_{suffix}.json"
-        filepath = config_dir / filename
-        
-        with open(filepath, 'w') as f:
-            json.dump(config_with_meta, f, indent=2)
-        
-        generated.append({
-            'file': filename,
-            'params': N,
-            'data_fraction': data_fraction,
-            'data_percent': data_pct,
-            'required_tokens': D_required
-        })
-        
-        print(f"  {suffix:<12} {N:>12,} {data_pct:>5.0f}% {D_required:>15,}")
-    
-    print()
-    return generated
-
-
-def create_sampling_utility(experiment_dir):
-    """Create a Python script for random data sampling directly to FASTA."""
-    script_content = '''#!/usr/bin/env python3
-"""Data sampling utility for Iso-Param analysis.
-
-Loads all sequences from NCBI FTP data, randomly samples a percentage,
-and outputs directly to a FASTA file.
+Produces, under <experiment_dir>:
+    configs/iso_token/*.json      -- N sweep at ~constant D (the full dataset)
+    configs/iso_param/*.json      -- one architecture, many D values
+    configs/iso_flop/<C>/*.json   -- one subdirectory per compute budget,
+                                     each holding an N sweep at that C
+    prepare_data_samples.sh       -- creates token-budgeted FASTA samples
+                                     (for iso-param and per-iso-flop-run)
+    experiment_summary.json       -- run manifest
 """
 
 import argparse
-import random
+import json
+import math
+import os
 from pathlib import Path
 
 
-def sample_to_fasta(data_dir, sample_percent, output_file, min_len=64, max_len=2048, seed=42):
-    """Create a random sample of sequences and save to FASTA.
-    
-    Args:
-        data_dir: Directory containing *_CDS.fasta files
-        sample_percent: Percentage of sequences to sample (0-100)
-        output_file: Path to save sampled FASTA
-        min_len: Minimum sequence length to keep
-        max_len: Maximum sequence length
-        seed: Random seed for reproducibility
+# --- Architecture helpers ----------------------------------------------------
+
+def _round_heads(d_model):
+    """Return n_heads such that head_dim = 64. Never goes below head_dim = 64."""
+    return max(1, d_model // 64)
+
+
+def _architecture_for(target_params, max_seq_len, vocab_size=7):
+    """Pick (d_model, n_heads, n_layers, d_ff) whose estimated param count is
+    close to `target_params`. Uses the standard 4x FFN ratio and a width/depth
+    schedule that roughly matches GPT-like models.
+
+    param estimate:
+        E  = 2*V*d              (embed + tied-shape output head)
+        A  = 4*d*d              (Q,K,V,O per layer)
+        F  = 2*d*ff             (2 linears per layer)
+        LN = 4*d                (2 layernorms per layer)
+        total = E + n_layers*(A + F + LN)
+
+    Constraints:
+        - d_model must be a multiple of 64 (ensures head_dim = 64 exactly)
+        - n_layers <= 4 * (d_model // 64)  (prevents extreme narrow+deep configs)
     """
+    best = None
+    for d_model in (64, 128, 192, 256, 320, 384, 512, 640, 768, 896,
+                    1024, 1152, 1280, 1408, 1536, 1792, 2048):
+        d_ff = 4 * d_model
+        max_layers = 4 * (d_model // 64)
+        for n_layers in range(2, max_layers + 1):
+            per_layer = 4 * d_model * d_model + 2 * d_model * d_ff + 4 * d_model
+            total = 2 * vocab_size * d_model + n_layers * per_layer
+            err = abs(total - target_params) / target_params
+            if best is None or err < best[0]:
+                best = (err, d_model, n_layers, d_ff, total)
+    _, d_model, n_layers, d_ff, total = best
+    n_heads = _round_heads(d_model)
+    return {
+        'd_model': d_model, 'n_heads': n_heads, 'n_layers': n_layers,
+        'd_ff': d_ff, 'dropout': 0.1, 'vocab_size': vocab_size,
+        'max_seq_len': max_seq_len, '_params_est': total,
+    }
+
+
+# --- Folder scaffolding ------------------------------------------------------
+
+def _mkdirs(base):
+    dirs = [
+        'configs/iso_token', 'configs/iso_param', 'configs/iso_flop',
+        'logs', 'checkpoints', 'results', 'data_samples', 'utils',
+    ]
+    for d in dirs:
+        (base / d).mkdir(parents=True, exist_ok=True)
+
+
+# --- Phase builders ----------------------------------------------------------
+
+def build_iso_token(cfg_dir, n_points, min_params, max_params, max_seq_len):
+    """N sweep: n_points model sizes evenly in log space."""
+    out = []
+    grid = [int(round(x)) for x in _logspace(min_params, max_params, n_points)]
+    for N in grid:
+        arch = _architecture_for(N, max_seq_len)
+        name = f'model_{_human(arch["_params_est"])}'
+        path = cfg_dir / f'{name}.json'
+        with open(path, 'w') as f:
+            json.dump(arch, f, indent=2)
+        out.append({'file': str(path), 'params': arch['_params_est'], 'name': name})
+    return out
+
+
+def build_iso_param(cfg_dir, params_target, max_seq_len):
+    """One architecture; the D sweep is done by selecting different FASTAs."""
+    arch = _architecture_for(params_target, max_seq_len)
+    name = f'model_{_human(arch["_params_est"])}'
+    path = cfg_dir / f'{name}.json'
+    with open(path, 'w') as f:
+        json.dump(arch, f, indent=2)
+    return {'file': str(path), 'params': arch['_params_est'], 'name': name}
+
+
+def build_iso_flop(cfg_dir, compute_budgets, n_points_per_bucket, max_seq_len,
+                   d_total_tokens):
+    """For each compute budget C, sweep N and compute D = C/(6N).
+
+    A run is only emitted if its required D is <= `d_total_tokens` (otherwise
+    we cannot feed enough data).
+    """
+    all_configs = []
+    for C in compute_budgets:
+        bucket_dir = cfg_dir / f'C_{C:.2e}'
+        bucket_dir.mkdir(parents=True, exist_ok=True)
+        # Pick N grid centred on the Chinchilla-optimal for this C (~sqrt(C/6/20)
+        # roughly). We just sweep over a decade on each side.
+        N_centre = max(int(math.sqrt(C / (6 * 20))), 10_000)
+        N_lo = max(10_000, N_centre // 10)
+        N_hi = min(N_centre * 10, 500_000_000)
+        if N_hi <= N_lo:
+            continue
+        Ns = _logspace(N_lo, N_hi, n_points_per_bucket)
+        for N_target in Ns:
+            arch = _architecture_for(int(round(N_target)), max_seq_len)
+            N = arch['_params_est']
+            D = int(C / (6 * N))
+            if D < 1_000_000 or D > d_total_tokens:
+                continue
+            meta = {
+                '_meta': {
+                    'target_flops': C,
+                    'params': N,
+                    'required_tokens': D,
+                    'data_fraction': D / d_total_tokens,
+                }
+            }
+            full = {**arch, **meta}
+            name = f'iso_flop_{_sci(C)}_{_human(N)}'
+            path = bucket_dir / f'{name}.json'
+            with open(path, 'w') as f:
+                json.dump(full, f, indent=2)
+            all_configs.append({
+                'file': str(path), 'params': N, 'tokens': D,
+                'flops': C, 'name': name, 'bucket': f'{C:.2e}',
+            })
+    return all_configs
+
+
+# --- Helpers -----------------------------------------------------------------
+
+def _logspace(lo, hi, n):
+    if n <= 1:
+        return [hi]
+    log_lo, log_hi = math.log(lo), math.log(hi)
+    return [math.exp(log_lo + (log_hi - log_lo) * i / (n - 1)) for i in range(n)]
+
+
+def _human(n):
+    for thr, suf in [(1_000_000_000, 'b'), (1_000_000, 'm'), (1_000, 'k')]:
+        if n >= thr:
+            return f'{n / thr:.1f}{suf}'.replace('.0', '')
+    return str(n)
+
+
+def _sci(x):
+    return f'{x:.1e}'.replace('+', '').replace('.0e', 'e')
+
+
+# --- Sampling utility generator ---------------------------------------------
+
+def write_sampling_utility(base):
+    """Writes a helper that samples sequences *by target token count*."""
+    code = '''\
+"""Sample sequences from FASTA files until a token budget is hit."""
+import argparse, random
+from pathlib import Path
+
+
+def sample_tokens(input_dir, target_tokens, output_file,
+                  min_len=64, max_len=2048, seed=42, pattern='*_CDS.fasta'):
     random.seed(seed)
-    
-    # Collect all sequences from all files
-    data_path = Path(data_dir)
-    fasta_files = list(data_path.glob("*_CDS.fasta"))
-    
-    print(f"Loading from {len(fasta_files)} FASTA files...")
-    
-    all_records = []  # [(header, sequence), ...]
-    
-    for f in fasta_files:
-        count = 0
-        with open(f) as fp:
-            current_header = None
-            current_seq = []
-            
-            for line in fp:
+    input_dir = Path(input_dir)
+    files = sorted(input_dir.glob(pattern))
+    if not files:
+        raise FileNotFoundError(
+            f'sample_to_fasta: no files matching "{pattern}" in {input_dir}')
+    records = []
+    for fp in files:
+        current = []
+        header = None
+        with open(fp) as f:
+            for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                    
                 if line.startswith('>'):
-                    # Save previous record
-                    if current_header and current_seq:
-                        seq = ''.join(current_seq)
-                        seq_len = len(seq)
-                        if min_len <= seq_len <= max_len:
-                            all_records.append((current_header, seq))
-                            count += 1
-                        elif seq_len > max_len:
-                            # Truncate
-                            all_records.append((current_header, seq[:max_len]))
-                            count += 1
-                    # Start new record
-                    current_header = line
-                    current_seq = []
+                    if header and current:
+                        seq = ''.join(current)
+                        if len(seq) >= min_len:
+                            records.append((header, seq[:max_len]))
+                    header = line
+                    current = []
                 else:
-                    current_seq.append(line)
-            
-            # Save last record
-            if current_header and current_seq:
-                seq = ''.join(current_seq)
-                seq_len = len(seq)
-                if min_len <= seq_len <= max_len:
-                    all_records.append((current_header, seq))
-                    count += 1
-                elif seq_len > max_len:
-                    all_records.append((current_header, seq[:max_len]))
-                    count += 1
-        
-        print(f"  {f.name}: {count} sequences")
-    
-    total_seqs = len(all_records)
-    print(f"\nTotal sequences loaded: {total_seqs:,}")
-    
-    # Calculate sample size
-    sample_size = int(total_seqs * sample_percent / 100)
-    print(f"Sampling {sample_percent}% = {sample_size:,} sequences")
-    
-    # Random sample
-    sampled = random.sample(all_records, sample_size)
-    
-    # Save to FASTA
-    output_path = Path(output_file)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(output_path, 'w') as f:
-        for header, seq in sampled:
-            f.write(f"{header}\\n")
-            # Write sequence in 80-character lines (standard FASTA)
+                    current.append(line)
+        if header and current:
+            seq = ''.join(current)
+            if len(seq) >= min_len:
+                records.append((header, seq[:max_len]))
+    random.shuffle(records)
+    out = Path(output_file)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    used = 0
+    written = 0
+    with open(out, 'w') as f:
+        for header, seq in records:
+            if used >= target_tokens:
+                break
+            f.write(header + '\\n')
             for i in range(0, len(seq), 80):
-                f.write(seq[i:i+80] + "\\n")
-    
-    # Calculate tokens
-    total_bases = sum(len(seq) for _, seq in sampled)
-    
-    print(f"Saved to: {output_path}")
-    print(f"Sampled sequences: {sample_size:,}")
-    print(f"Estimated tokens: {total_bases:,}")
-    
-    return output_path
+                f.write(seq[i:i+80] + '\\n')
+            used += len(seq)
+            written += 1
+    print(f'  {out}: wrote {written:,} seqs / {used:,} tokens (target {target_tokens:,})')
+    return used
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Sample sequences from NCBI data to FASTA")
-    parser.add_argument('--data_dir', default='ncbi_ftp_output', help='Directory with FASTA files')
-    parser.add_argument('--sample_percent', type=float, required=True, help='Percentage to sample (0-100)')
-    parser.add_argument('--output', required=True, help='Output FASTA file path')
-    parser.add_argument('--min_len', type=int, default=64, help='Minimum sequence length')
-    parser.add_argument('--max_len', type=int, default=2048, help='Maximum sequence length')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    args = parser.parse_args()
-    
-    sample_to_fasta(args.data_dir, args.sample_percent, args.output, 
-                    args.min_len, args.max_len, args.seed)
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--data_dir', required=True)
+    ap.add_argument('--target_tokens', type=int, required=True)
+    ap.add_argument('--output', required=True)
+    ap.add_argument('--min_len', type=int, default=64)
+    ap.add_argument('--max_len', type=int, default=2048)
+    ap.add_argument('--seed', type=int, default=42)
+    ap.add_argument('--pattern', default='*_CDS.fasta',
+                    help='Glob pattern for input FASTA files.')
+    args = ap.parse_args()
+    sample_tokens(args.data_dir, args.target_tokens, args.output,
+                  args.min_len, args.max_len, args.seed, args.pattern)
 '''
-    
-    script_path = Path(experiment_dir) / "utils" / "sample_to_fasta.py"
-    script_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(script_path, 'w') as f:
-        f.write(script_content)
-    
-    # Make executable
-    os.chmod(script_path, 0o755)
-    print(f"\nCreated sampling utility: {script_path}")
-    return script_path
+    path = base / 'utils' / 'sample_to_fasta.py'
+    path.write_text(code)
+    os.chmod(path, 0o755)
+    return path
 
 
-def create_preprocessing_script(experiment_dir, ncbi_data="ncbi_ftp_output"):
-    """Create a script to pre-generate all data samples for Iso-Param."""
-    script_content = f'''#!/bin/bash
-# Pre-generate data samples for Iso-Param analysis
+# --- Eval-set carving --------------------------------------------------------
 
-SAMPLES_DIR="{experiment_dir}/data_samples"
-DATA_DIR="{ncbi_data}"
+def write_eval_split_utility(base):
+    """Writes a helper that carves a fixed held-out FASTA from raw data."""
+    code = '''\
+"""Carve a fixed held-out eval FASTA from raw data (run once, reuse everywhere).
 
-mkdir -p "$SAMPLES_DIR"
+Everything not selected for eval is written to the train FASTA.
+"""
+import argparse, random
+from pathlib import Path
 
-echo "Generating data samples for Iso-Param analysis..."
-echo ""
 
-# Sampling levels (percentage of full data)
-LEVELS=(6.25 12.5 25 50 100)
+def split(input_dir, eval_tokens, train_out, eval_out,
+          min_len=64, max_len=2048, seed=42, pattern='*_CDS.fasta'):
+    random.seed(seed)
+    input_dir = Path(input_dir)
+    files = sorted(input_dir.glob(pattern))
+    records = []
+    for fp in files:
+        current = []
+        header = None
+        with open(fp) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith('>'):
+                    if header and current:
+                        seq = ''.join(current)
+                        if len(seq) >= min_len:
+                            records.append((header, seq[:max_len]))
+                    header = line
+                    current = []
+                else:
+                    current.append(line)
+        if header and current:
+            seq = ''.join(current)
+            if len(seq) >= min_len:
+                records.append((header, seq[:max_len]))
+    random.shuffle(records)
 
-for pct in "${{LEVELS[@]}}"; do
-    echo "Generating ${{pct}}% sample..."
-    python3 {experiment_dir}/utils/sample_to_fasta.py \\
-        --data_dir "$DATA_DIR" \\
-        --sample_percent "$pct" \\
-        --output "$SAMPLES_DIR/sample_${{pct}}pct.fasta" \\
-        --seed 42
-done
+    Path(train_out).parent.mkdir(parents=True, exist_ok=True)
+    Path(eval_out).parent.mkdir(parents=True, exist_ok=True)
+    e_tokens = 0
+    e_count = 0
+    with open(eval_out, 'w') as fe, open(train_out, 'w') as ft:
+        for header, seq in records:
+            if e_tokens < eval_tokens:
+                fe.write(header + '\\n')
+                for i in range(0, len(seq), 80):
+                    fe.write(seq[i:i+80] + '\\n')
+                e_tokens += len(seq)
+                e_count += 1
+            else:
+                ft.write(header + '\\n')
+                for i in range(0, len(seq), 80):
+                    ft.write(seq[i:i+80] + '\\n')
+    total = len(records)
+    print(f'  eval : {e_count:,} seqs / {e_tokens:,} tokens -> {eval_out}')
+    print(f'  train: {total - e_count:,} seqs                -> {train_out}')
 
-echo ""
-echo "All samples generated in: $SAMPLES_DIR"
-echo ""
-ls -lh "$SAMPLES_DIR"
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--data_dir', required=True)
+    ap.add_argument('--eval_tokens', type=int, required=True)
+    ap.add_argument('--train_out', required=True)
+    ap.add_argument('--eval_out', required=True)
+    ap.add_argument('--min_len', type=int, default=64)
+    ap.add_argument('--max_len', type=int, default=2048)
+    ap.add_argument('--seed', type=int, default=42)
+    args = ap.parse_args()
+    split(args.data_dir, args.eval_tokens, args.train_out, args.eval_out,
+          args.min_len, args.max_len, args.seed)
 '''
-    
-    script_path = Path(experiment_dir) / "prepare_data_samples.sh"
-    
-    with open(script_path, 'w') as f:
-        f.write(script_content)
-    
-    os.chmod(script_path, 0o755)
-    print(f"Created preprocessing script: {script_path}")
-    return script_path
+    path = base / 'utils' / 'carve_eval_split.py'
+    path.write_text(code)
+    os.chmod(path, 0o755)
+    return path
 
+
+# --- Main --------------------------------------------------------------------
 
 def main():
-    print("="*60)
-    print("Setting Up Scaling Law Experiment")
-    print("="*60)
-    
-    # Setup folders
-    experiment_dir = setup_folder_structure("scaling_experiment")
-    
-    # Generate Iso-Token configs (varying model sizes)
-    print("\n[Phase 1] Generating Iso-Token configs...")
-    iso_token_configs = generate_iso_token_configs(
-        experiment_dir / "configs" / "iso_token"
+    ap = argparse.ArgumentParser(description='Generate scaling-sweep configs')
+    ap.add_argument('--experiment_dir', default='scaling_experiment')
+    ap.add_argument('--data_total_tokens', type=int, default=3_950_000_000,
+                    help='Approximate total tokens available in the dataset.')
+    ap.add_argument('--max_seq_len', type=int, default=2048)
+
+    ap.add_argument('--iso_token_points', type=int, default=8,
+                    help='Number of N values in the Iso-Token sweep.')
+    ap.add_argument('--iso_token_min_params', type=int, default=100_000)
+    ap.add_argument('--iso_token_max_params', type=int, default=200_000_000)
+
+    ap.add_argument('--iso_param_model', type=int, default=30_000_000,
+                    help='Target param count of the fixed model used in Iso-Param.')
+    ap.add_argument('--iso_param_fractions', type=float, nargs='+',
+                    default=[0.0625, 0.125, 0.25, 0.5, 1.0])
+
+    ap.add_argument('--iso_flop_budgets', type=str,
+                    default='1e15,3e15,1e16,3e16',
+                    help='Comma-separated compute budgets in FLOPs.')
+    ap.add_argument('--iso_flop_points_per_bucket', type=int, default=5)
+    args = ap.parse_args()
+
+    base = Path(args.experiment_dir)
+    _mkdirs(base)
+    sampling_util = write_sampling_utility(base)
+    eval_split_util = write_eval_split_utility(base)
+
+    iso_token_dir = base / 'configs' / 'iso_token'
+    iso_param_dir = base / 'configs' / 'iso_param'
+    iso_flop_dir = base / 'configs' / 'iso_flop'
+
+    print('=' * 60)
+    print('Setting up scaling experiment')
+    print('=' * 60)
+
+    print('\n[iso_token] configs')
+    iso_token_cfgs = build_iso_token(
+        iso_token_dir, args.iso_token_points,
+        args.iso_token_min_params, args.iso_token_max_params, args.max_seq_len,
     )
-    
-    # Use 100M config as "best" for Iso-Param (conservative middle-ground)
-    # In practice, Phase 1 will determine the actual best
-    best_config = iso_token_configs[-2]['config']  # 100m model
-    
-    # Generate Iso-Param config
-    print("\n[Phase 2] Generating Iso-Param config...")
-    iso_param_config = generate_iso_param_configs(
-        experiment_dir / "configs" / "iso_param",
-        best_config
+    for c in iso_token_cfgs:
+        print(f'  {c["name"]}: {c["params"]:,} params -> {c["file"]}')
+
+    print('\n[iso_param] config')
+    iso_param_cfg = build_iso_param(iso_param_dir, args.iso_param_model, args.max_seq_len)
+    print(f'  {iso_param_cfg["name"]}: {iso_param_cfg["params"]:,} params '
+          f'-> {iso_param_cfg["file"]}')
+
+    print('\n[iso_flop] configs')
+    budgets = [float(x) for x in args.iso_flop_budgets.split(',') if x.strip()]
+    iso_flop_cfgs = build_iso_flop(
+        iso_flop_dir, budgets, args.iso_flop_points_per_bucket,
+        args.max_seq_len, args.data_total_tokens,
     )
-    
-    # Generate Iso-FLOP configs
-    print("\n[Phase 3] Generating Iso-FLOP configs...")
-    # Fixed compute based on 1M model with full data
-    iso_flop_configs = generate_iso_flop_configs(
-        experiment_dir / "configs" / "iso_flop"
-    )
-    
-    # Create sampling utility (outputs FASTA directly)
-    sampling_utility = create_sampling_utility(experiment_dir)
-    
-    # Create preprocessing script
-    preprocessing_script = create_preprocessing_script(experiment_dir)
-    
-    # Create summary file
+    for c in iso_flop_cfgs:
+        print(f'  [C={c["bucket"]}] {c["name"]}: '
+              f'N={c["params"]:,} D={c["tokens"]:,}')
+
     summary = {
-        "experiment_structure": {
-            "iso_token": {
-                "description": "Vary model size, constant full data (~3.95B tokens)",
-                "configs": len(iso_token_configs),
-                "model_sizes": [c['params'] for c in iso_token_configs]
-            },
-            "iso_param": {
-                "description": "Constant model, vary data via random sampling",
-                "base_model": "model_100m.json",
-                "sampling_levels": [6.25, 12.5, 25, 50, 100],
-                "data_samples_dir": "data_samples"
-            },
-            "iso_flop": {
-                "description": "Fixed compute budget: 1M model with 100% data. Variable data per model (data_fraction = N_ref/N_model)",
-                "reference_model": "1M params with 3.95B tokens",
-                "target_flops": "~2.37e+16",
-                "configs": len(iso_flop_configs),
-                "models": [{"name": c["file"], "params": c["params"], "data_pct": c["data_percent"]} for c in iso_flop_configs]
-            }
+        'args': vars(args),
+        'iso_token': iso_token_cfgs,
+        'iso_param': iso_param_cfg,
+        'iso_flop': iso_flop_cfgs,
+        'utilities': {
+            'sampling': str(sampling_util),
+            'eval_split': str(eval_split_util),
         },
-        "total_tokens_available": 3_950_000_000,
-        "chinchilla_optimal_params": 197_500_000,
-        "utilities": {
-            "sampling": str(sampling_utility),
-            "preprocessing": str(preprocessing_script)
-        }
     }
-    
-    summary_path = experiment_dir / "experiment_summary.json"
-    with open(summary_path, 'w') as f:
-        json.dump(summary, f, indent=2)
-    
-    print(f"\nExperiment summary saved to: {summary_path}")
-    print("\n" + "="*60)
-    print("Setup complete!")
-    print("="*60)
-    print(f"\nNext steps:")
-    print(f"1. Generate data samples:")
-    print(f"   ./scaling_experiment/prepare_data_samples.sh")
-    print(f"\n2. Run the orchestration script:")
-    print(f"   ./run_scaling_orchestrator.sh")
+    with open(base / 'experiment_summary.json', 'w') as f:
+        json.dump(summary, f, indent=2, default=str)
+    print('\nSetup complete. Manifest:', base / 'experiment_summary.json')
 
 
 if __name__ == '__main__':

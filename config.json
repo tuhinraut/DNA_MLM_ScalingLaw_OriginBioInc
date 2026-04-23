@@ -1,61 +1,26 @@
 {
   "experiment": {
     "name": "DNA MLM Scaling Laws",
-    "description": "Three-phase scaling law analysis for DNA transformer models",
-    "phases": [
-      "iso_token",
-      "iso_param",
-      "iso_flop"
-    ]
+    "phases": ["iso_token", "iso_param", "iso_flop"],
+    "note": "Per-run config lives in <experiment_dir>/configs/*.json; this file is informational only."
   },
   "data": {
-    "sources": {
-      "ncbi_ftp": {
-        "description": "NCBI Genomes FTP - protein coding CDS",
-        "expected_species": 33,
-        "expected_sequences": 1890165,
-        "expected_tokens": 3950000000
-      }
-    },
-    "download_scripts": {
-      "ncbi": "data_downloaders/download_ncbi_ftp.py"
-    }
+    "source": "NCBI Genomes FTP (protein-coding CDS)",
+    "downloader": "data_downloaders/download_ncbi_ftp.py",
+    "expected_species": 33,
+    "expected_tokens": 3950000000
   },
-  "training": {
-    "hyperparameters": {
-      "max_seq_len": 2048,
-      "min_seq_len": 64,
-      "batch_size": 32,
-      "learning_rate": 0.0001,
-      "mask_prob": 0.15,
-      "eval_every": 500,
-      "seed": 42
-    },
-    "iso_token": {
-      "epochs": 1,
-      "description": "Vary model size, constant full data"
-    },
-    "iso_param": {
-      "epochs": 1,
-      "description": "Constant model, vary data via sampling",
-      "sampling_levels": [
-        6.25,
-        12.5,
-        25,
-        50,
-        100
-      ]
-    },
-    "iso_flop": {
-      "description": "Constant FLOPs, vary N/D via multi-epoch",
-      "note": "Multiple epochs allowed here to achieve Iso-FLOP curves"
-    }
-  },
-  "output": {
-    "experiment_dir": "experiments",
-    "logs_dir": "experiments/logs",
-    "checkpoints_dir": "experiments/checkpoints",
-    "results_dir": "experiments/results",
-    "data_samples_dir": "experiments/data_samples"
+  "defaults": {
+    "max_seq_len": 2048,
+    "min_seq_len": 64,
+    "batch_size": 32,
+    "gradient_accumulation_steps": 1,
+    "grad_clip": 1.0,
+    "learning_rate": 1e-4,
+    "mask_prob": 0.15,
+    "warmup_frac": 0.05,
+    "num_epochs": 1,
+    "eval_every": 500,
+    "seed": 42
   }
 }

@@ -1,6 +1,10 @@
+"""Dataset, tokenizer, and FASTA loader for DNA MLM."""
+
+import random
+from pathlib import Path
+
 import torch
 from torch.utils.data import Dataset
-import random
 
 
 class DNATokenizer:
@@ -15,25 +19,17 @@ class DNATokenizer:
         self.mask_token_id = self.vocab['[MASK]']
 
     def encode(self, sequence):
-        """Map a raw DNA string to a list of token ids."""
-        tokens = []
+        out = []
         for char in sequence.upper():
-            if char in self.vocab:
-                tokens.append(self.vocab[char])
-            else:
-                tokens.append(self.vocab['N'])
-        return tokens
+            out.append(self.vocab.get(char, self.vocab['N']))
+        return out
 
     def decode(self, token_ids):
         return ''.join(self.id_to_token.get(tid, '?') for tid in token_ids)
 
 
 class DNASequenceDataset(Dataset):
-    """Dataset for DNA sequence MLM training.
-
-    Takes a list of raw DNA strings, tokenizes them, pads to a
-    fixed length, and applies MLM masking on the fly.
-    """
+    """Tokenises DNA strings, pads to max_seq_len, applies MLM masking on-the-fly."""
 
     def __init__(self, sequences, tokenizer, max_seq_len=512, mask_prob=0.15):
         self.tokenizer = tokenizer
@@ -45,9 +41,7 @@ class DNASequenceDataset(Dataset):
         return len(self.sequences)
 
     def __getitem__(self, idx):
-        sequence = self.sequences[idx]
-        token_ids = self.tokenizer.encode(sequence)
-
+        token_ids = self.tokenizer.encode(self.sequences[idx])
         if len(token_ids) > self.max_seq_len:
             token_ids = token_ids[: self.max_seq_len]
 
@@ -55,13 +49,11 @@ class DNASequenceDataset(Dataset):
         labels = token_ids.copy()
         masked_ids = token_ids.copy()
 
-        
-        for i in range(len(masked_ids)):
+        for i in range(seq_len):
             if masked_ids[i] == self.tokenizer.pad_token_id:
                 labels[i] = -100
                 continue
-
-            if random.random() < self.mask_prob: ## error here. the 15 percent masking is made to be 85% because of the incorrect if statements. changed the > to <
+            if random.random() < self.mask_prob:
                 masked_ids[i] = self.tokenizer.mask_token_id
             else:
                 labels[i] = -100
@@ -78,84 +70,53 @@ class DNASequenceDataset(Dataset):
         }
 
 
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
+def _parse_fasta(filepath):
+    """Yield sequences from a FASTA file, joining multi-line records."""
+    current = []
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('>'):
+                if current:
+                    yield ''.join(current)
+                    current = []
+            else:
+                current.append(line)
+        if current:
+            yield ''.join(current)
 
-def load_sequences(filepaths, min_len, max_seq_len):
-    """Load sequences from one or more FASTA files.
-    
-    Args:
-        filepaths: Single path (str/Path) or list of paths to FASTA files
-        min_len: Minimum sequence length to keep
-        max_seq_len: Maximum sequence length (truncate if longer)
-    
-    Returns:
-        List of filtered sequences
+
+def load_sequences(filepaths, min_len=64, max_seq_len=2048):
+    """Load sequences from one or more FASTA files, filtered by length.
+
+    Sequences shorter than min_len are dropped; longer than max_seq_len are truncated.
     """
     if isinstance(filepaths, (str, Path)):
         filepaths = [filepaths]
-    
-    all_sequences = []
-    total_skipped = 0
-    total_truncated = 0
-    
-    for filepath in filepaths:
-        filepath = Path(filepath)
-        if not filepath.exists():
-            print(f"Warning: File not found: {filepath}")
+
+    out = []
+    for fp in filepaths:
+        fp = Path(fp)
+        if not fp.exists():
             continue
-        
-        sequences = []
-        current_seq = []
-        
-        with open(filepath, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith('>'):
-                    if current_seq:
-                        sequences.append(''.join(current_seq))
-                        current_seq = []
-                else:
-                    current_seq.append(line)
-            if current_seq:
-                sequences.append(''.join(current_seq))
-        
-        skipped_count = 0
-        trunc_count = 0
-        filtered_sequences = []
-        
-        for seq in sequences:
-            seq_len = len(seq)
-            if seq_len < min_len:
-                skipped_count += 1
+        for seq in _parse_fasta(fp):
+            if len(seq) < min_len:
                 continue
-            if seq_len > max_seq_len:
-                trunc_count += 1
-                filtered_sequences.append(seq[:max_seq_len])
-                continue
-            filtered_sequences.append(seq)
-        
-        all_sequences.extend(filtered_sequences)
-        total_skipped += skipped_count
-        total_truncated += trunc_count
-        print(f"  Loaded {filepath.name}: {len(filtered_sequences):,} sequences "
-              f"(skipped {skipped_count}, truncated {trunc_count})")
-    
-    print(f"Total sequences loaded: {len(all_sequences):,}")
-    return all_sequences
-# -----------------------------------------------------------------------------------------------------------------------------------------------------------
+            if len(seq) > max_seq_len:
+                seq = seq[:max_seq_len]
+            out.append(seq)
+    return out
 
 
-def generate_synthetic_sequences(num_sequences, min_len=100, max_seq_len=1000, seed=42):
-    """Generate random DNA sequences for testing / debugging."""
+def generate_synthetic_sequences(num_sequences, min_len=64, max_seq_len=1000, seed=42):
+    """Random DNA strings for CPU debugging."""
     rng = random.Random(seed)
     nucleotides = 'ACGT'
-    sequences = []
-    for _ in range(num_sequences):
-        length = rng.randint(min_len, max_seq_len)
-        seq = ''.join(rng.choice(nucleotides) for _ in range(length))
-        sequences.append(seq)
-    return sequences
+    lo = min(min_len, max_seq_len)
+    hi = max(lo, max_seq_len)
+    return [
+        ''.join(rng.choice(nucleotides) for _ in range(rng.randint(lo, hi)))
+        for _ in range(num_sequences)
+    ]

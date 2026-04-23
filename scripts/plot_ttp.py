@@ -1,465 +1,200 @@
+"""Chinchilla-style IsoFLOP / TTP analysis.
+
+Consumes the *final* (N, D, loss) of each training run -- one point per run --
+and groups them into iso-FLOP buckets by log10(C). Produces a 4-panel figure:
+
+    left   : loss vs N for each iso-FLOP bucket, parabolic fit, vertex marked
+    center : optimal N vs C (power-law fit; Chinchilla ~ 0.50)
+    right  : optimal D vs C (power-law fit; Chinchilla ~ 0.50)
+    bottom : loss vs TTP = D/N for each iso-FLOP bucket (the spec's TTP view)
+
+Requires at least one bucket with >=3 runs for parabolic fits.
 """
-TTP / IsoFLOP analysis plot - Chinchilla-style (Hoffmann et al. 2022).
 
-Produces Figure 3-style IsoFLOP curves with parabolic fits:
-- Left panel: IsoFLOP curves (loss vs N) with parabolic fits showing valleys
-- Center & Right panels: Optimal N and D projections vs FLOPs
-
-Based on "Training Compute-Optimal Large Language Models" (Chinchilla paper).
-
-Usage:
-    python scripts/plot_ttp.py --log_dir experiments/logs --output_dir plots
-"""
-
+import argparse
 import json
 import os
-import argparse
 from collections import defaultdict
-
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 from pathlib import Path
 
-
-def load_training_logs(log_dir):
-    """Load all training_log_*.json files from a directory."""
-    logs = []
-    for path in sorted(Path(log_dir).glob('training_log*.json')):
-        with open(path) as f:
-            logs.append(json.load(f))
-    return logs
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.lines import Line2D
 
 
-def _loss_from_entry(entry):
-    """Prefer training loss; fall back to eval loss."""
-    for key in ('train_loss', 'eval_loss', 'loss'):
-        if key in entry and entry[key] is not None:
-            return float(entry[key])
-    return None
+def load_runs(log_dir):
+    runs = []
+    for p in sorted(Path(log_dir).glob('training_log_*.json')):
+        with open(p) as f:
+            data = json.load(f)
+        N = data.get('num_parameters')
+        D = data.get('final_tokens_seen')
+        loss = data.get('final_eval_loss')
+        if loss is None and data.get('log'):
+            loss = data['log'][-1].get('eval_loss')
+        if not (N and D and loss and loss > 0):
+            continue
+        runs.append({'N': N, 'D': D, 'C': 6 * N * D, 'loss': loss,
+                     'run': data.get('run_name', p.stem)})
+    return runs
 
 
-def fit_parabola(x, y):
-    """
-    Fit a parabola y = a*(x-h)^2 + k to find the minimum (valley).
-    Returns (a, h, k) where (h, k) is the vertex (minimum point).
-    """
-    try:
-        # Fit quadratic: y = ax^2 + bx + c
-        coeffs = np.polyfit(x, y, 2)
-        a, b, c = coeffs
-
-        # Vertex is at x = -b/(2a)
-        h = -b / (2 * a)
-        k = a * h**2 + b * h + c
-
-        return a, h, k, coeffs
-    except:
-        return None, None, None, None
-
-
-def plot_ttp_chinchilla(logs, output_dir='plots'):
-    """
-    Chinchilla-style IsoFLOP plot with parabolic fits (Figure 3).
-
-    Key features:
-    - Parabolic fits to each iso-FLOP bucket showing clear valleys
-    - Marked minimum points (optimal N for each compute budget)
-    - Three panels: IsoFLOP curves, optimal N projection, optimal D projection
-    """
-    entries = []
-    for log in logs:
-        log_entries = log.get('log', [])
-        for entry in log_entries:
-            N = entry['num_parameters']
-            D = entry['tokens_seen']
-            loss = _loss_from_entry(entry)
-            if loss is None:
-                continue
-            C = 6 * N * D
-            entries.append({'N': N, 'D': D, 'C': C, 'loss': loss})
-
-    if not entries:
-        print('No entries with loss values to plot.')
-        return
-
-    # Bucket by approximate compute (log10 FLOPs, one decimal).
+def bucket_by_flops(runs, round_digits=1):
+    """Group runs by log10(C), rounded to `round_digits` decimal places."""
     buckets = defaultdict(list)
-    for e in entries:
-        c_val = float(e['C'])
-        buckets[round(np.log10(c_val), 1)].append(e)
+    for r in runs:
+        buckets[round(np.log10(r['C']), round_digits)].append(r)
+    return buckets
 
-    # Create three-panel figure (like Chinchilla Figure 3)
-    fig = plt.figure(figsize=(16, 5))
-    gs = fig.add_gridspec(1, 3, wspace=0.3)
 
-    ax_left = fig.add_subplot(gs[0, 0])      # IsoFLOP curves
-    ax_center = fig.add_subplot(gs[0, 1])     # Optimal N vs FLOPs
-    ax_right = fig.add_subplot(gs[0, 2])     # Optimal D vs FLOPs
+def _parabola_vertex(log_x, y):
+    """Fit y = a*(log_x)^2 + b*log_x + c; return (coeffs, x_vertex, y_vertex)."""
+    coeffs = np.polyfit(log_x, y, 2)
+    a, b, c = coeffs
+    if a <= 0:  # not a valley
+        return coeffs, None, None
+    lv = -b / (2 * a)
+    return coeffs, np.exp(lv), a * lv * lv + b * lv + c
 
-    # Color map for different FLOP budgets
-    sorted_buckets = sorted(buckets.keys())
-    cmap = plt.cm.tab10(np.linspace(0, 0.9, len(sorted_buckets)))
 
-    # Store optimal points for center and right panels
-    optimal_points = []  # (C, N_opt, D_opt, loss_opt)
+def plot_isoflop(runs, output_dir):
+    buckets = bucket_by_flops(runs)
+    sorted_keys = sorted(buckets)
+    cmap = plt.cm.viridis(np.linspace(0.1, 0.9, max(1, len(sorted_keys))))
 
-    # ========== LEFT PANEL: IsoFLOP curves with parabolic fits ==========
-    for idx, logc_key in enumerate(sorted_buckets):
-        group = buckets[logc_key]
-        color = cmap[idx]
+    fig = plt.figure(figsize=(16, 10))
+    gs = fig.add_gridspec(2, 3, height_ratios=[1, 1], hspace=0.32, wspace=0.3)
+    ax_L = fig.add_subplot(gs[0, 0])
+    ax_C = fig.add_subplot(gs[0, 1])
+    ax_R = fig.add_subplot(gs[0, 2])
+    ax_B = fig.add_subplot(gs[1, :])
 
-        # Sort by N for plotting
-        sorted_g = sorted(group, key=lambda x: x['N'])
-        x_vals = np.array([e['N'] for e in sorted_g])
-        y_vals = np.array([e['loss'] for e in sorted_g])
-        d_vals = [e['D'] for e in sorted_g]
+    optima = []  # (C, N_opt, D_opt, loss_opt)
 
-        # Plot data points
-        for i, (x, y, d) in enumerate(zip(x_vals, y_vals, d_vals)):
-            ax_left.scatter(
-                x, y,
-                c=[color],
-                marker='o',
-                s=80,
-                edgecolors='0.2',
-                linewidths=0.8,
-                zorder=3,
-                alpha=0.9,
-            )
+    for i, key in enumerate(sorted_keys):
+        group = sorted(buckets[key], key=lambda r: r['N'])
+        color = cmap[i]
+        Ns = np.array([r['N'] for r in group], dtype=float)
+        Ds = np.array([r['D'] for r in group], dtype=float)
+        Ls = np.array([r['loss'] for r in group], dtype=float)
 
-        # Fit and plot parabola (the key Chinchilla feature!)
-        if len(sorted_g) >= 3:
-            a, h, k, coeffs = fit_parabola(np.log(x_vals), y_vals)
+        ax_L.scatter(Ns, Ls, c=[color], s=80, edgecolors='black', linewidth=0.7, zorder=3)
+        ax_B.scatter(Ds / Ns, Ls, c=[color], s=80, edgecolors='black', linewidth=0.7, zorder=3)
 
-            if a is not None and a > 0:  # a > 0 means it's a valley (convex)
-                # Generate smooth curve
-                x_smooth = np.linspace(np.log(x_vals.min()), np.log(x_vals.max()), 200)
-                y_smooth = np.polyval(coeffs, x_smooth)
+        if len(Ns) >= 3:
+            coeffs, N_opt, L_opt = _parabola_vertex(np.log(Ns), Ls)
+            grid = np.linspace(np.log(Ns.min()), np.log(Ns.max()), 200)
+            ax_L.plot(np.exp(grid), np.polyval(coeffs, grid),
+                      color=color, alpha=0.6, linewidth=1.8, zorder=2)
+            if N_opt is not None:
+                C_med = float(np.median([r['C'] for r in group]))
+                D_opt = C_med / (6 * N_opt)
+                optima.append((C_med, N_opt, D_opt, L_opt))
+                ax_L.scatter([N_opt], [L_opt], marker='*', s=200,
+                             c=[color], edgecolors='black', linewidth=1.2, zorder=4)
+        elif len(Ns) >= 2:
+            ax_L.plot(Ns, Ls, color=color, linestyle='--', alpha=0.5, linewidth=1.2)
 
-                # Plot parabolic fit
-                ax_left.plot(
-                    np.exp(x_smooth), y_smooth,
-                    color=color,
-                    linewidth=2,
-                    alpha=0.6,
-                    zorder=2,
-                    linestyle='-',
-                )
+    ax_L.set_xscale('log')
+    ax_L.set_xlabel('Parameters (N)')
+    ax_L.set_ylabel('Eval Loss')
+    ax_L.set_title('IsoFLOP curves (loss vs N)')
+    ax_L.grid(True, alpha=0.3, which='both')
+    legend_handles = [
+        Line2D([0], [0], color=cmap[i], marker='*', linewidth=2,
+               label=f'6ND ≈ 1e{k:.1f}')
+        for i, k in enumerate(sorted_keys)
+    ]
+    ax_L.legend(handles=legend_handles, fontsize=8, title='IsoFLOP', loc='best')
 
-                # Mark the minimum point (optimal N for this C)
-                n_opt = np.exp(h)
-                loss_opt = k
+    # Center: optimal N vs C ------------------------------------------------
+    if len(optima) >= 2:
+        Cs = np.array([o[0] for o in optima])
+        Ns = np.array([o[1] for o in optima])
+        ax_C.scatter(Cs, Ns, c=cmap[:len(optima)], s=150, marker='*',
+                     edgecolors='black', linewidth=1.2, zorder=3)
+        b, a = np.polyfit(np.log(Cs), np.log(Ns), 1)
+        grid = np.geomspace(Cs.min(), Cs.max(), 100)
+        ax_C.plot(grid, np.exp(a) * grid ** b, 'k--', alpha=0.8,
+                  label=f'N_opt ∝ C^{b:.3f}')
+        ax_C.legend(fontsize=10)
+    ax_C.set_xscale('log'); ax_C.set_yscale('log')
+    ax_C.set_xlabel('FLOPs C'); ax_C.set_ylabel('Optimal N')
+    ax_C.set_title('Optimal N vs compute')
+    ax_C.grid(True, alpha=0.3, which='both')
 
-                ax_left.scatter(
-                    [n_opt], [loss_opt],
-                    c=[color],
-                    marker='*',
-                    s=200,
-                    edgecolors='black',
-                    linewidths=1.5,
-                    zorder=4,
-                )
+    # Right: optimal D vs C -------------------------------------------------
+    if len(optima) >= 2:
+        Cs = np.array([o[0] for o in optima])
+        Ds = np.array([o[2] for o in optima])
+        ax_R.scatter(Cs, Ds, c=cmap[:len(optima)], s=150, marker='*',
+                     edgecolors='black', linewidth=1.2, zorder=3)
+        b, a = np.polyfit(np.log(Cs), np.log(Ds), 1)
+        grid = np.geomspace(Cs.min(), Cs.max(), 100)
+        ax_R.plot(grid, np.exp(a) * grid ** b, 'k--', alpha=0.8,
+                  label=f'D_opt ∝ C^{b:.3f}')
+        ax_R.legend(fontsize=10)
+    ax_R.set_xscale('log'); ax_R.set_yscale('log')
+    ax_R.set_xlabel('FLOPs C'); ax_R.set_ylabel('Optimal D')
+    ax_R.set_title('Optimal D vs compute')
+    ax_R.grid(True, alpha=0.3, which='both')
 
-                # Store for center panel
-                c_median = np.median([e['C'] for e in sorted_g])
-                d_opt = c_median / (6 * n_opt)  # D = C / (6N)
-                optimal_points.append((c_median, n_opt, d_opt, loss_opt))
+    # Bottom: loss vs TTP (the spec's TTP plot) -----------------------------
+    ax_B.set_xscale('log')
+    ax_B.set_xlabel('TTP = D / N')
+    ax_B.set_ylabel('Eval Loss')
+    ax_B.set_title('Loss vs tokens-per-parameter, one curve per iso-FLOP bucket')
+    ax_B.grid(True, alpha=0.3, which='both')
 
-                # Add annotation for the minimum
-                ax_left.annotate(
-                    f'{n_opt/1e6:.1f}M',
-                    (n_opt, loss_opt),
-                    xytext=(5, 5),
-                    textcoords='offset points',
-                    fontsize=7,
-                    color=color,
-                    fontweight='bold',
-                )
+    # Reconnect points per bucket on the TTP axis, parabolic fit over log(D/N).
+    for i, key in enumerate(sorted_keys):
+        group = sorted(buckets[key], key=lambda r: r['D'] / r['N'])
+        if len(group) < 2:
+            continue
+        xs = np.array([r['D'] / r['N'] for r in group], dtype=float)
+        ys = np.array([r['loss'] for r in group], dtype=float)
+        color = cmap[i]
+        if len(xs) >= 3:
+            coeffs, x_opt, y_opt = _parabola_vertex(np.log(xs), ys)
+            grid = np.linspace(np.log(xs.min()), np.log(xs.max()), 200)
+            ax_B.plot(np.exp(grid), np.polyval(coeffs, grid),
+                      color=color, alpha=0.6, linewidth=1.8, zorder=2)
+            if x_opt is not None:
+                ax_B.scatter([x_opt], [y_opt], marker='*', s=200, c=[color],
+                             edgecolors='black', linewidth=1.2, zorder=4)
         else:
-            # Just connect points with line if not enough for parabola
-            ax_left.plot(
-                x_vals, y_vals,
-                color=color,
-                linewidth=1.5,
-                alpha=0.5,
-                zorder=2,
-                linestyle='--',
-            )
+            ax_B.plot(xs, ys, color=color, linestyle='--', alpha=0.5, linewidth=1.2)
 
-    ax_left.set_xlabel('Parameters (N)', fontsize=11, fontweight='bold')
-    ax_left.set_ylabel('Training Loss', fontsize=11, fontweight='bold')
-    ax_left.set_title('IsoFLOP curves (parabolic fits)\nMarker = minimum (optimal N)',
-                      fontsize=12, fontweight='bold')
-    ax_left.set_xscale('log')
-    ax_left.grid(True, alpha=0.3, which='both')
+    fig.suptitle('IsoFLOP / TTP analysis  (final-eval points only)',
+                 fontsize=13, fontweight='bold', y=0.995)
+    out = Path(output_dir) / 'ttp_analysis.png'
+    fig.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close(fig)
 
-    # Legend for FLOP buckets
-    flop_handles = [
-        Line2D(
-            [0], [0],
-            linestyle='-',
-            color=cmap[i],
-            linewidth=2.5,
-            marker='*',
-            markersize=10,
-            label=f'6ND = 10^{k:.1f}',
-        )
-        for i, k in enumerate(sorted_buckets)
-    ]
-    ax_left.legend(
-        handles=flop_handles,
-        title='IsoFLOP Budget',
-        loc='upper right',
-        fontsize=8,
-        title_fontsize=9,
-    )
-
-    # ========== CENTER PANEL: Optimal N vs FLOPs ==========
-    if optimal_points:
-        c_vals = np.array([p[0] for p in optimal_points])
-        n_vals = np.array([p[1] for p in optimal_points])
-
-        # Plot optimal points
-        ax_center.scatter(
-            c_vals, n_vals,
-            c=cmap[:len(optimal_points)],
-            s=150,
-            marker='*',
-            edgecolors='black',
-            linewidths=1.5,
-            zorder=3,
-        )
-
-        # Fit power law: N_opt ~ C^a
-        log_c = np.log(c_vals)
-        log_n = np.log(n_vals)
-
-        if len(c_vals) >= 2:
-            # Linear fit in log-log space
-            fit = np.polyfit(log_c, log_n, 1)
-            a, b = fit  # N = exp(b) * C^a
-
-            # Generate smooth curve
-            c_smooth = np.linspace(c_vals.min(), c_vals.max() * 10, 200)
-            n_pred = np.exp(b) * c_smooth ** a
-
-            ax_center.plot(
-                c_smooth, n_pred,
-                'k--',
-                linewidth=2,
-                alpha=0.7,
-                zorder=2,
-                label=f'N ~ C^{a:.2f}',
-            )
-
-            print(f"\nPower law fit: N_opt ~ C^{a:.3f}")
-            print(f"  (Chinchilla paper reports a ~ 0.49-0.50)")
-
-        ax_center.set_xlabel('FLOPs (C = 6ND)', fontsize=11, fontweight='bold')
-        ax_center.set_ylabel('Optimal Parameters (N)', fontsize=11, fontweight='bold')
-        ax_center.set_title('Optimal model size vs compute\n(star = minimum of each parabola)',
-                          fontsize=12, fontweight='bold')
-        ax_center.set_xscale('log')
-        ax_center.set_yscale('log')
-        ax_center.grid(True, alpha=0.3, which='both')
-        ax_center.legend(loc='upper left', fontsize=9)
-
-        # Add Chinchilla-style annotation
-        if len(c_vals) > 0:
-            max_c = c_vals.max()
-            max_n = n_vals[c_vals.argmax()]
-            ax_center.annotate(
-                f'C = {max_c:.1e}\nN = {max_n/1e6:.0f}M',
-                (max_c, max_n),
-                xytext=(10, 10),
-                textcoords='offset points',
-                fontsize=8,
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.3),
-            )
-
-    # ========== RIGHT PANEL: Optimal D vs FLOPs ==========
-    if optimal_points:
-        c_vals = np.array([p[0] for p in optimal_points])
-        d_vals = np.array([p[2] for p in optimal_points])
-
-        # Plot optimal points
-        ax_right.scatter(
-            c_vals, d_vals,
-            c=cmap[:len(optimal_points)],
-            s=150,
-            marker='*',
-            edgecolors='black',
-            linewidths=1.5,
-            zorder=3,
-        )
-
-        # Fit power law: D_opt ~ C^b
-        log_c = np.log(c_vals)
-        log_d = np.log(d_vals)
-
-        if len(c_vals) >= 2:
-            fit = np.polyfit(log_c, log_d, 1)
-            b, c = fit  # D = exp(c) * C^b
-
-            # Generate smooth curve
-            c_smooth = np.linspace(c_vals.min(), c_vals.max() * 10, 200)
-            d_pred = np.exp(c) * c_smooth ** b
-
-            ax_right.plot(
-                c_smooth, d_pred,
-                'k--',
-                linewidth=2,
-                alpha=0.7,
-                zorder=2,
-                label=f'D ~ C^{b:.2f}',
-            )
-
-            print(f"Power law fit: D_opt ~ C^{b:.3f}")
-            print(f"  (Chinchilla paper reports b ~ 0.50-0.51)")
-            print(f"\nScaling recommendation: For every doubling of compute,")
-            print(f"  increase model size by {2**a:.1f}x and tokens by {2**b:.1f}x")
-
-        ax_right.set_xlabel('FLOPs (C = 6ND)', fontsize=11, fontweight='bold')
-        ax_right.set_ylabel('Optimal Training Tokens (D)', fontsize=11, fontweight='bold')
-        ax_right.set_title('Optimal tokens vs compute\n(star = from parabola minima)',
-                         fontsize=12, fontweight='bold')
-        ax_right.set_xscale('log')
-        ax_right.set_yscale('log')
-        ax_right.grid(True, alpha=0.3, which='both')
-        ax_right.legend(loc='upper left', fontsize=9)
-
-        # Add Chinchilla-style annotation
-        if len(c_vals) > 0:
-            max_c = c_vals.max()
-            max_d = d_vals[c_vals.argmax()]
-            ax_right.annotate(
-                f'C = {max_c:.1e}\nD = {max_d/1e9:.1f}B',
-                (max_c, max_d),
-                xytext=(10, 10),
-                textcoords='offset points',
-                fontsize=8,
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgreen', alpha=0.3),
-            )
-
-    # Overall title
-    fig.suptitle(
-        'Chinchilla-style IsoFLOP Analysis\n' +
-        '(Following Hoffmann et al. 2022: "Training Compute-Optimal Large Language Models")',
-        fontsize=13,
-        fontweight='bold',
-        y=1.02,
-    )
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'ttp_analysis_chinchilla.png'),
-                dpi=150, bbox_inches='tight')
-    plt.close()
-
-    print(f"\nChinchilla-style plot saved to: {output_dir}/ttp_analysis_chinchilla.png")
-    print(f"  Data points: {len(entries)}")
-    print(f"  IsoFLOP buckets: {len(buckets)}")
-    print(f"  Parabolic fits: {len(optimal_points)}")
+    summary = {
+        'num_runs': len(runs),
+        'num_buckets': len(sorted_keys),
+        'bucket_sizes': {f'1e{k:.1f}': len(buckets[k]) for k in sorted_keys},
+        'optima': [{'C': c, 'N_opt': n, 'D_opt': d, 'loss': L} for (c, n, d, L) in optima],
+    }
+    with open(Path(output_dir) / 'ttp_summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+    print(f'[plot_ttp] {len(runs)} runs in {len(sorted_keys)} buckets -> {out}')
 
 
-def plot_ttp_simple(logs, output_dir='plots'):
-    """
-    Simple IsoFLOP plot (original style, for comparison).
-    """
-    entries = []
-    for log in logs:
-        log_entries = log.get('log', [])
-        for entry in log_entries:
-            N = entry['num_parameters']
-            D = entry['tokens_seen']
-            loss = _loss_from_entry(entry)
-            if loss is None:
-                continue
-            C = 6 * N * D
-            entries.append({'N': N, 'D': D, 'C': C, 'loss': loss})
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--log_dir', required=True)
+    ap.add_argument('--output_dir', default='plots')
+    args = ap.parse_args()
 
-    if not entries:
-        print('No entries with loss values to plot.')
+    os.makedirs(args.output_dir, exist_ok=True)
+    runs = load_runs(args.log_dir)
+    if not runs:
+        print(f'[plot_ttp] no usable training logs in {args.log_dir}')
         return
-
-    buckets = defaultdict(list)
-    for e in entries:
-        buckets[round(np.log10(e['C']), 1)].append(e)
-
-    all_D = sorted({e['D'] for e in entries})
-    marker_cycle = ['o', 's', '^', 'D', 'v', 'P', 'X', '*', 'h', 'p']
-    D_to_marker = {d: marker_cycle[i % len(marker_cycle)] for i, d in enumerate(all_D)}
-
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-    cmap = plt.cm.tab10(np.linspace(0, 0.9, max(len(buckets), 1)))
-
-    for idx, logc_key in enumerate(sorted(buckets.keys())):
-        group = buckets[logc_key]
-        color = cmap[idx % len(cmap)]
-        for e in sorted(group, key=lambda x: x['N']):
-            ax.scatter(
-                e['N'], e['loss'],
-                c=[color], marker=D_to_marker[e['D']], s=72,
-                edgecolors='0.2', linewidths=0.6, zorder=3,
-            )
-        sorted_g = sorted(group, key=lambda x: x['N'])
-        if len(sorted_g) > 1:
-            ax.plot(
-                [x['N'] for x in sorted_g], [x['loss'] for x in sorted_g],
-                color=color, alpha=0.35, linewidth=1.2, zorder=1,
-            )
-
-    ax.set_xlabel('Parameters (N)')
-    ax.set_ylabel('Loss')
-    ax.set_title('IsoFLOP curves: loss vs parameters (marker = tokens seen D)')
-
-    n_span = max(e['N'] for e in entries) / max(min(e['N'] for e in entries), 1)
-    if n_span > 10:
-        ax.set_xscale('log')
-
-    flop_handles = [
-        Line2D([0], [0], linestyle='-', color=cmap[i % len(cmap)], linewidth=2.5,
-               label=f'6ND ~ {float(np.median([e["C"] for e in buckets[k]])):.2e}')
-        for i, k in enumerate(sorted(buckets.keys()))
-    ]
-    token_handles = [
-        Line2D([0], [0], linestyle='', marker=D_to_marker[d], color='0.35', markersize=8,
-               label=f'D = {d:,}')
-        for d in all_D
-    ]
-
-    leg1 = ax.legend(handles=flop_handles, title='IsoFLOP (approx.)',
-                     loc='upper right', fontsize=8)
-    ax.add_artist(leg1)
-    ax.legend(handles=token_handles, title='Tokens seen (D)',
-              loc='lower left', fontsize=8)
-
-    ax.grid(True, alpha=0.3, which='both')
-    fig.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'ttp_analysis.png'), dpi=150)
-    plt.close()
-    print(f"Simple plot saved to: {output_dir}/ttp_analysis.png")
+    plot_isoflop(runs, args.output_dir)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        description='Generate TTP / IsoFLOP analysis plots (Chinchilla-style with parabolic fits)')
-    parser.add_argument('--log_dir', type=str, default='experiments/logs',
-                        help='Directory containing training_log_*.json files')
-    parser.add_argument('--output_dir', type=str, default='plots')
-    parser.add_argument('--style', type=str, default='chinchilla',
-                        choices=['chinchilla', 'simple'],
-                        help='Plot style: chinchilla (3-panel with parabolas) or simple (1-panel)')
-    args = parser.parse_args()
-
-    logs = load_training_logs(args.log_dir)
-    if not logs:
-        print(f"No training logs found in {args.log_dir}")
-    else:
-        print(f"Loaded {len(logs)} training logs")
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-
-        if args.style == 'chinchilla':
-            plot_ttp_chinchilla(logs, args.output_dir)
-        else:
-            plot_ttp_simple(logs, args.output_dir)
+    main()
